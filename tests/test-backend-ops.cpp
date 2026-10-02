@@ -4633,6 +4633,51 @@ struct test_mul_mat : public test_case {
     }
 };
 
+#define P 1.0f
+#define N -1.0f
+
+// constant Hadamard matrix via Paley I construction
+static constexpr float H12[12][12] = {
+    { P, P, P, P, P, P, P, P, P, P, P, P },
+    { P, N, P, N, P, P, P, N, N, N, P, N },
+    { P, N, N, P, N, P, P, P, N, N, N, P },
+    { P, P, N, N, P, N, P, P, P, N, N, N },
+    { P, N, P, N, N, P, N, P, P, P, N, N },
+    { P, N, N, P, N, N, P, N, P, P, P, N },
+    { P, N, N, N, P, N, N, P, N, P, P, P },
+    { P, P, N, N, N, P, N, N, P, N, P, P },
+    { P, P, P, N, N, N, P, N, N, P, N, P },
+    { P, P, P, P, N, N, N, P, N, N, P, N },
+    { P, N, P, P, P, N, N, N, P, N, N, P },
+    { P, P, N, P, P, P, N, N, N, P, N, N }
+};
+
+static constexpr float H20[20][20] = {
+    { P, P, P, P, P, P, P, P, P, P, P, P, P, P, P, P, P, P, P, P },
+    { P, N, P, N, N, P, P, P, P, N, P, N, P, N, N, N, N, P, P, N },
+    { P, N, N, P, N, N, P, P, P, P, N, P, N, P, N, N, N, N, P, P },
+    { P, P, N, N, P, N, N, P, P, P, P, N, P, N, P, N, N, N, N, P },
+    { P, P, P, N, N, P, N, N, P, P, P, P, N, P, N, P, N, N, N, N },
+    { P, N, P, P, N, N, P, N, N, P, P, P, P, N, P, N, P, N, N, N },
+    { P, N, N, P, P, N, N, P, N, N, P, P, P, P, N, P, N, P, N, N },
+    { P, N, N, N, P, P, N, N, P, N, N, P, P, P, P, N, P, N, P, N },
+    { P, N, N, N, N, P, P, N, N, P, N, N, P, P, P, P, N, P, N, P },
+    { P, P, N, N, N, N, P, P, N, N, P, N, N, P, P, P, P, N, P, N },
+    { P, N, P, N, N, N, N, P, P, N, N, P, N, N, P, P, P, P, N, P },
+    { P, P, N, P, N, N, N, N, P, P, N, N, P, N, N, P, P, P, P, N },
+    { P, N, P, N, P, N, N, N, N, P, P, N, N, P, N, N, P, P, P, P },
+    { P, P, N, P, N, P, N, N, N, N, P, P, N, N, P, N, N, P, P, P },
+    { P, P, P, N, P, N, P, N, N, N, N, P, P, N, N, P, N, N, P, P },
+    { P, P, P, P, N, P, N, P, N, N, N, N, P, P, N, N, P, N, N, P },
+    { P, P, P, P, P, N, P, N, P, N, N, N, N, P, P, N, N, P, N, N },
+    { P, N, P, P, P, P, N, P, N, P, N, N, N, N, P, P, N, N, P, N },
+    { P, N, N, P, P, P, P, N, P, N, P, N, N, N, N, P, P, N, N, P },
+    { P, P, N, N, P, P, P, P, N, P, N, P, N, N, N, N, P, P, N, N }
+};
+
+#undef P
+#undef N
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -4657,20 +4702,58 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "a") == 0) {
-                const int64_t n_cols = t->ne[0];
-                const int64_t n_rows = ggml_nrows(t);
+                const int64_t      n_cols = t->ne[0];
+                const int64_t      n_rows = ggml_nrows(t);
                 std::vector<float> data(n_cols * n_rows);
-                float scale = 1.0f / sqrtf((float)n_cols);
-                for (int64_t r = 0; r < n_rows; r++) {
-                    float * row_data = data.data() + r * n_cols;
-                    for (int64_t i = 0; i < n_cols; i++) {
-                        int pop = 0;
-                        int64_t val = r & i;
-                        while (val) {
-                            pop += (val & 1);
-                            val >>= 1;
+                float              scale = 1.0f / sqrtf((float) n_cols);
+
+                auto is_pow2 = [](const int64_t a) {
+                    return (a > 0) && ((a & (a - 1)) == 0);
+                };
+#ifdef GGML_USE_SYCL
+                const bool is_kronecker =
+                    ((n_cols % 12 == 0) && is_pow2(n_cols / 12)) || ((n_cols % 20 == 0) && is_pow2(n_cols / 20));
+#else
+                const bool is_kronecker = false;
+#endif
+                if (is_kronecker) {
+                    const int64_t B = (n_cols % 12 == 0 && is_pow2(n_cols / 12)) ? 12 : 20;
+                    for (int64_t r = 0; r < n_rows; r++) {
+                        float *       row_data = data.data() + r * n_cols;
+                        const int64_t r_mod    = r % n_cols;
+                        const int64_t r_b      = r_mod / B;
+                        const int64_t r_m      = r_mod % B;
+
+                        for (int64_t i = 0; i < n_cols; i++) {
+                            const int64_t c_b = i / B;
+                            const int64_t c_m = i % B;
+
+                            int     pop = 0;
+                            int64_t val = r_b & c_b;
+                            while (val) {
+                                pop += (val & 1);
+                                val >>= 1;
+                            }
+                            const float sign_m = (pop % 2 == 0) ? 1.0f : -1.0f;
+                            const float sign_b = (B == 12) ? H12[c_m][r_m] : H20[c_m][r_m];
+
+                            row_data[i] = scale * sign_b * sign_m;
                         }
-                        row_data[i] = (pop % 2 == 0) ? scale : -scale;
+                    }
+                }
+
+                else if (is_pow2(n_cols)) {
+                    for (int64_t r = 0; r < n_rows; r++) {
+                        float * row_data = data.data() + r * n_cols;
+                        for (int64_t i = 0; i < n_cols; i++) {
+                            int     pop_cnt = 0;
+                            int64_t val     = r & i;
+                            while (val) {
+                                pop_cnt += (val & 1);
+                                val >>= 1;
+                            }
+                            row_data[i] = (pop_cnt % 2 == 0) ? scale : -scale;
+                        }
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
@@ -9292,7 +9375,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 2));
     test_cases.emplace_back(new test_fwht_signed(8192, 8192, 1,  GGML_TYPE_F16));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
-
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
+#ifdef GGML_USE_SYCL
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 1, 384));    // m=12 (N=384)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 32, 384));   // m=12 (batch)
+    test_cases.emplace_back(
+        new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 4, 384, { 2, 3 }));             // m=12 (multi-dim)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 768, 1, 768));   // m=12 (N=768)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 1, 640));   // m=20 (N=640)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 32, 640));  // m=20 (batch)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1280, 1, 1280));  // m=20 (N=1280)
+#endif
 #if 0
     // > 4GB A matrix. Too slow to be enabled by default.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16,  900000,  3, 2592, {1, 1}, {1, 1}));
@@ -9329,6 +9422,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 64, n, 2048, {1, 2}, {2, 1}));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PTQ1_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4, 2, false, 70, n, 2048));
+    }
+
+    // PQ2_0 at speculative verify widths (Metal few-row tensor tile): every n up to 32 plus
+    // the mul_mm sizes past it, row counts with a partial 32-row block, and two K lengths
+    for (int64_t n = 1; n <= 32; ++n) {
+        for (int64_t k : {1024, 5120}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 97, n, k, {1, 1}, {1, 1}));
+        }
+    }
+    for (int64_t n : {9, 16, 17, 32, 64, 512}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 4096, n, 17408, {1, 1}, {1, 1}));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -10392,6 +10496,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // speculative decoding attention: the DFlash2 drafter block (hd 128, 8 KV heads x 4,
+    // 8 queries, 2048 sliding window) and the 27B target's verify (hd 256, 4 KV heads x 6)
+    for (int nb : {1, 8, 16}) {
+        for (int kv : {256, 1024, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+        for (int kv : {1024, 8192, 32768}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
+    // PQ2_0 at speculative verify widths, at the 27B projection shapes and the vocab head
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_PQ2_0, GGML_TYPE_F32, 10240, n, 5120, {1, 1}, {1, 1}));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
@@ -10549,6 +10671,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+#ifdef GGML_USE_SYCL
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 1, 384));    // m=12 (N=384)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 32, 384));   // m=12 (batch)
+    test_cases.emplace_back(
+        new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 384, 4, 384, { 2, 3 }));             // m=12 (multi-dim)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 768, 1, 768));   // m=12 (N=768)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 1, 640));   // m=20 (N=640)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 640, 32, 640));  // m=20 (batch)
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1280, 1, 1280));  // m=20 (N=1280)
+#endif
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));
     // qwen3next with CHUNK_SIZE 64

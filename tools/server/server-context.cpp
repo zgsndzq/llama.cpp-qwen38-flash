@@ -211,6 +211,7 @@ struct server_slot {
     int32_t spec_n_max_tail  = 0; // draft size from spec_tail_depth on (--spec-draft-n-max-tail, 0 = spec_n_max)
     int32_t spec_tail_depth  = 0; // start of the tiered-KV host tail (--kv-vram-cells, 0 = none)
 
+
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;

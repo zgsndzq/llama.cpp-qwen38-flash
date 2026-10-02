@@ -21,6 +21,8 @@
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <unordered_set>
 
@@ -1348,6 +1350,7 @@ void llm_graph_result::reset() {
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
     t_h_capture   = nullptr;
+    t_logits_ids  = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -1522,6 +1525,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
     samplers(params.samplers),
+    draft_vocab_ids(params.draft_vocab_ids),
+    draft_vocab_head(params.draft_vocab_head),
     cb_func(params.cb),
     res(params.res),
     ctx0(res->get_ctx()),
@@ -3890,6 +3895,9 @@ void llm_graph_context::build_sampling() const {
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
     res->add_input(std::move(inp_sampling));
 
+    // shortlisted draft logits: sampler picks are compact row indices and must be mapped back to token ids
+    ggml_tensor * ids_map = res->t_logits_ids;
+
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
     uint32_t n_rows = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -3946,7 +3954,7 @@ void llm_graph_context::build_sampling() const {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ ids_map,
             };
 
             assert(sampler->iface->backend_apply);
@@ -4002,6 +4010,146 @@ void llm_graph_context::build_sampling() const {
         }
     }
     */
+}
+
+// Only these head layouts reach the CUDA MMVQ one-row-expert path (no expert sorting, no dequantization).
+static bool draft_vocab_direct(const ggml_tensor * head) {
+    if (!head->buffer || !ggml_is_contiguous(head)) {
+        return false;
+    }
+    auto * buft = ggml_backend_buffer_get_type(head->buffer);
+    auto * dev  = ggml_backend_buft_get_device(buft);
+    if (!dev || std::strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 ||
+            buft != ggml_backend_dev_buffer_type(dev)) {
+        return false;
+    }
+    switch (head->type) {
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0: case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_PTQ1_0: // Prism packed ternary group-128 (Ternary-Bonsai's output.weight);
+                               // the CUDA MMVQ one-row-expert path already has vec_dot_ptq1_0_q8_1
+            return true;
+        default:
+            return false;
+    }
+}
+
+ggml_tensor * llm_graph_context::build_draft_vocab_logits(
+        ggml_tensor * head_w,
+        ggml_tensor * head_s,
+        ggml_tensor * cur) const {
+    if (draft_vocab_ids == nullptr || n_outputs == 0 || head_w == nullptr) {
+        return nullptr;
+    }
+    // When the head's weights were folded into a Hadamard-rotated basis (prism.hadamard), the
+    // activation has to be folded the same way before the rows can be scored -- exactly the
+    // transform build_lora_mm would have applied on the full-head path. Returning nullptr here
+    // used to silently disable the shortlist for such models.
+    ggml_tensor * cur_rot = cur;
+    if (hadamard_rotations) {
+        const auto it_h = hadamard_rotations->find(head_w);
+        if (it_h != hadamard_rotations->end()) {
+            const auto & t = it_h->second;
+            // another folded weight on this same activation may have built the transform already
+            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+            const auto memo_it  = hadamard_memo.find(memo_key);
+            if (memo_it != hadamard_memo.end()) {
+                cur_rot = memo_it->second;
+            } else {
+                if (t.perm_rep > 1) {
+                    // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+                    ggml_tensor * x = ggml_is_contiguous(cur_rot) ? cur_rot : ggml_cont(ctx0, cur_rot);
+                    const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+                    x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+                    x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+                    cur_rot = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+                }
+                if (t.signs) {
+                    cur_rot = ggml_mul(ctx0, cur_rot, t.signs);
+                }
+                cur_rot = llama_mul_mat_hadamard(ctx0, cur_rot, t.rot);
+                hadamard_memo[memo_key] = cur_rot;
+            }
+        }
+    }
+    if ((loras && !loras->empty()) || (head_s && ggml_nelements(head_s) != 1)) {
+        return nullptr;
+    }
+    if (draft_vocab_ids->ne[0] >= head_w->ne[1] || !draft_vocab_direct(head_w)) {
+        return nullptr;
+    }
+    // the compact logits never reach the host: every output row must be consumed by a backend sampler
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            if (samplers.find(ubatch.seq_id[i][j]) == samplers.end()) {
+                return nullptr;
+            }
+        }
+    }
+    GGML_ASSERT(cur->ne[1] == n_outputs);
+    GGML_ASSERT(cur_rot->ne[1] == n_outputs);
+
+    const int64_t n_sel = draft_vocab_ids->ne[0];
+
+    // Three ways to score only the shortlisted rows of the head. Only the first one actually reads
+    // fewer bytes than the full head, so it is tried first.
+    //
+    // compact (when the context built one): one plain 2-D matmul against a [n_embd, n_sel] tensor
+    //   holding exactly the shortlisted rows in the head's own format. Reads n_sel of n_vocab rows
+    //   and never leaves that format.
+    if (draft_vocab_head != nullptr &&
+        draft_vocab_head->ne[1] == n_sel && draft_vocab_head->ne[0] == cur_rot->ne[0]) {
+        ggml_tensor * logits = ggml_mul_mat(ctx0, draft_vocab_head, cur_rot); // [n_sel, n_outputs]
+        logits = ggml_reshape_2d(ctx0, logits, n_sel, n_outputs);
+        if (head_s) {
+            logits = ggml_mul(ctx0, logits, head_s);
+        }
+        cb(logits, "draft_vocab_logits", -1);
+        res->t_logits_ids = draft_vocab_ids;
+        return logits;
+    }
+    //
+    // indexed (LLAMA_DRAFT_VOCAB_INDEXED=1): view the head as one-row experts and answer with an
+    //   indexed matmul -- the shipped design. On this build the CUDA path it selects
+    //   (mul_mat_vec_q_indexed_rows) returns garbage for PTQ1_0: the dedicated PTQ1_0 mat-vec is
+    //   gated behind !ids and the generic kernel that runs instead disagrees with the planar
+    //   transposed activation layout the PTQ1_0 vec_dot expects. Measured effect: draft acceptance
+    //   collapses to exactly 0.000 over 190 drafts, which no merely-worse drafter would do.
+    //
+    // packed (default): gather the rows into a dense [n_embd, n_sel] block and run one plain 2-D
+    //   matmul, which does have a dedicated and correct PTQ1_0 kernel. It still reads n_sel rows
+    //   instead of all 248320. Cost: one gather of the selected quantized rows per graph build.
+    static const bool use_indexed = getenv("LLAMA_DRAFT_VOCAB_INDEXED") != nullptr;
+
+    ggml_tensor * logits = nullptr;
+    if (use_indexed) {
+        // each vocabulary row is a one-row expert of the existing head: no second weight matrix
+        ggml_tensor * rows = ggml_reshape_3d(ctx0, head_w, head_w->ne[0], 1, head_w->ne[1]);
+        for (int64_t i = 0; i < n_outputs; ++i) {
+            ggml_tensor * h_i = n_outputs == 1 ? cur_rot : ggml_view_2d(ctx0, cur_rot, cur_rot->ne[0], 1, cur_rot->nb[1], i*cur_rot->nb[1]);
+            ggml_tensor * l_i = ggml_mul_mat_id(ctx0, rows, h_i, draft_vocab_ids); // [1, n_sel, 1]
+            l_i = ggml_reshape_2d(ctx0, l_i, n_sel, 1);
+            logits = logits ? ggml_concat(ctx0, logits, l_i, 1) : l_i;
+        }
+    } else {
+        ggml_tensor * packed = ggml_get_rows(ctx0, head_w, draft_vocab_ids); // [n_embd, n_sel]
+        logits = ggml_mul_mat(ctx0, packed, cur_rot);                        // [n_sel, n_outputs, ...]
+        logits = ggml_reshape_2d(ctx0, logits, n_sel, n_outputs);
+    }
+    if (head_s) {
+        logits = ggml_mul(ctx0, logits, head_s);
+    }
+    cb(logits, "draft_vocab_logits", -1);
+
+    res->t_logits_ids = draft_vocab_ids;
+
+    return logits;
 }
 
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional) {

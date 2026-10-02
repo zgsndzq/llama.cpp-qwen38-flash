@@ -239,6 +239,9 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
+    // true once this request's output was folded into the adaptive draft-vocabulary tail
+    bool draft_vocab_observed = false;
+
 
     std::vector<completion_token_output> generated_token_probs;
 
@@ -345,6 +348,7 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        draft_vocab_observed = false;
         json_schema = json();
 
         task_prev = std::move(task);
@@ -521,6 +525,8 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
+            draft_vocab_observe_generated();
+
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
@@ -537,6 +543,23 @@ struct server_slot {
             callback_on_release(id);
         }
     }
+
+    // adaptive draft-vocabulary tail: fold this request's output into the hot statistics.
+    // generated_tokens is only filled when the task asked for its tokens back, so take the generated
+    // tail of the slot's own sequence instead. The refresh happens at the next request's prompt.
+    void draft_vocab_observe_generated() {
+        if (ctx_dft == nullptr || draft_vocab_observed || stats.n_gen <= 0) {
+            return;
+        }
+        draft_vocab_observed = true;
+        if (llama_draft_vocab_n_hot(ctx_dft) <= 0) {
+            return;
+        }
+        const auto & toks = prompt.tokens.get_tokens();
+        const size_t n    = std::min((size_t) stats.n_gen, toks.size());
+        llama_draft_vocab_observe(ctx_dft, toks.data() + (toks.size() - n), n);
+    }
+
 
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, bool is_full_stop) {
         GGML_ASSERT(task);
@@ -998,7 +1021,10 @@ private:
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end() ||
+                              std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -2049,6 +2075,8 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        slot.draft_vocab_observe_generated();
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2736,7 +2764,52 @@ private:
     };
 #endif
 
+    // --- SPC-SRV-TIMING: opt-in (env SPC_SRV_TIMING=1) decomposition of the
+    //     per-round wall time of the spec-decode loop. Zero effect when unset.
+    static bool srv_timing_on() {
+        static const bool v = getenv("SPC_SRV_TIMING") != nullptr;
+        return v;
+    }
+
+    struct srv_timer {
+        int64_t & t;
+        int64_t & n;
+        int64_t   t0;
+        bool      on;
+        srv_timer(int64_t & t_, int64_t & n_) : t(t_), n(n_), t0(0), on(srv_timing_on()) {
+            if (on) { t0 = ggml_time_us(); }
+        }
+        ~srv_timer() {
+            if (on) { t += ggml_time_us() - t0; n++; }
+        }
+    };
+
+    int64_t st_pre   = 0; int64_t sn_pre   = 0;   // pre_decode() incl. draft
+    int64_t st_draft = 0; int64_t sn_draft = 0;   // common_speculative_draft() only
+    int64_t st_dec   = 0; int64_t sn_dec   = 0;   // decode() = launch + sync wait
+    int64_t st_round = 0; int64_t sn_round = 0;   // decode() calls with <= 8 tokens & output
+    int64_t sn_round_tok = 0;
+    int64_t st_post  = 0; int64_t sn_post  = 0;   // post_decode()
+
+    void srv_timing_print() {
+        if (!srv_timing_on()) { return; }
+        static int64_t t_prev = 0;
+        const int64_t t_now = ggml_time_us();
+        if (t_now - t_prev < 2000 * 1000) { return; }
+        t_prev = t_now;
+        SRV_INF("SRV-TIMING pre=%.3f draft=%.3f(n=%lld) pre-draft=%.3f dec=%.3f round=%.3f post=%.3f | n_dec=%lld n_round=%lld tok/round=%.2f\n",
+                (double) st_pre   / std::max<int64_t>(1, sn_pre)   / 1000.0,
+                (double) st_draft / std::max<int64_t>(1, sn_draft) / 1000.0, (long long) sn_draft,
+                ((double) st_pre - (double) st_draft) / std::max<int64_t>(1, sn_pre) / 1000.0,
+                (double) st_dec   / std::max<int64_t>(1, sn_dec)   / 1000.0,
+                (double) st_round / std::max<int64_t>(1, sn_round) / 1000.0,
+                (double) st_post  / std::max<int64_t>(1, sn_post)  / 1000.0,
+                (long long) sn_dec, (long long) sn_round,
+                (double) sn_round_tok / std::max<int64_t>(1, sn_round));
+    }
+
     void update_slots() {
+        srv_timing_print();
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -2778,6 +2851,7 @@ private:
         }
 
         try {
+            srv_timer tpre(st_pre, sn_pre);
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
@@ -2842,6 +2916,7 @@ private:
             }
 
             try {
+                srv_timer tpost(st_post, sn_post);
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
@@ -2989,6 +3064,7 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                srv_timer tdraft(st_draft, sn_draft);
                 common_speculative_draft(spec.get());
             });
         }
@@ -3369,6 +3445,17 @@ private:
                                 send_partial_response(slot, {}, false, true);
                             }
                         }
+                        // adaptive draft-vocabulary tail: make this prompt's own ids hot before it is
+                        // decoded, then re-rank the slots. Request granularity, no graph in flight.
+                        if (ctx_dft && llama_draft_vocab_n_hot(ctx_dft) > 0) {
+                            common_speculative_observe(spec_init.get(), input_tokens.get_tokens());
+
+                            const int32_t n_replaced = common_speculative_refresh(spec_init.get());
+
+                            SLT_INF(slot, "draft vocab hot: %d/%d slots replaced, %zu candidates\n",
+                                    n_replaced, llama_draft_vocab_n_hot(ctx_dft),
+                                    llama_draft_vocab_n_candidates(ctx_dft));
+                        }
                     } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
@@ -3624,12 +3711,21 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool srv_t_on = srv_timing_on();
+        const int64_t srv_t0 = srv_t_on ? ggml_time_us() : 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (srv_t_on) {
+            st_dec += ggml_time_us() - srv_t0; sn_dec++;
+            if (has_output && batch_view.n_tokens <= 8) {
+                st_round += ggml_time_us() - srv_t0; sn_round++;
+                sn_round_tok += batch_view.n_tokens;
+            }
+        }
 
         if (ret != 0) {
             {

@@ -305,7 +305,7 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         // alone. GGML_CUDA_PTQ1_MMVQ_MAX overrides the crossover.
         static const int max_cols = [] {
             const char * e = getenv("GGML_CUDA_PTQ1_MMVQ_MAX");
-            return e ? atoi(e) : (ggml_cuda_batch_invariant() ? MMVQ_MAX_BATCH_SIZE : 4);
+            return e ? atoi(e) : (ggml_cuda_batch_invariant() ? MMVQ_MAX_BATCH_SIZE : 5);
         }();
         return ne11 <= max_cols;
     }

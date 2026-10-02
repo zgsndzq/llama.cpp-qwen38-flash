@@ -1601,6 +1601,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             splits[i] = free;
         }
+        // when the primary device is already full (free == 0 everywhere, e.g. a draft
+        // model loaded next to a resident target), a free-memory split is meaningless:
+        // fall back to total memory so the split points stay strictly increasing and
+        // upper_bound() in get_layer_buft_list() cannot run past the last device
+        if (std::all_of(splits.begin(), splits.end(), [](float s) { return s <= 0.0f; })) {
+            for (size_t i = 0; i < n_devices(); ++i) {
+                size_t free, total;
+                ggml_backend_dev_memory(devices[i].dev, &free, &total);
+                splits[i] = total > 0 ? total : 1;
+            }
+        }
     } else {
         std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
     }

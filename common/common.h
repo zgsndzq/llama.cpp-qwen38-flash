@@ -173,6 +173,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // MTP with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
@@ -227,13 +228,13 @@ struct common_params_sampling {
     int32_t n_prev             = 64;     // number of previous tokens to remember
     int32_t n_probs            = 0;      // if greater than 0, output the probabilities of top n_probs tokens.
     int32_t min_keep           = 0;      // 0 = disabled, otherwise samplers should return at least min_keep tokens
-    int32_t top_k              = 40;     // <= 0 to use vocab size
+    int32_t top_k              = 20;     // <= 0 to use vocab size (adaq8: Bonsai serving recipe)
     float   top_p              = 0.95f;  // 1.0 = disabled
-    float   min_p              = 0.05f;  // 0.0 = disabled
+    float   min_p              = 0.00f;  // 0.0 = disabled (adaq8: Bonsai serving recipe)
     float   xtc_probability    = 0.00f;  // 0.0 = disabled
     float   xtc_threshold      = 0.10f;  // > 0.5 disables XTC
     float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
-    float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
+    float   temp               = 0.60f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities (adaq8)
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
     int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
@@ -325,6 +326,11 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    // adaptive MTP draft depth floor (--spec-type draft-mtp-adaptive): the controller starts
+    // here, never drops below, and climbs towards n_max while the verify keeps accepting.
+    // Only read when the adaptive type is selected; it is the whole point of the type that
+    // it can fall back below n_max, so the default is the lowest useful depth.
+    int32_t n_min_adaptive = 1;
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -339,13 +345,16 @@ struct common_params_speculative_draft {
     // them, so its cells are reused, its cache stays small and on the device, and a draft pass costs the same
     // at any depth. The MTP head predicts the next few tokens from recent context: 16k rows accept as many
     // drafts as the full history at 131k.
-    int32_t n_window = 0;
+    int32_t n_window = 16384; // adaq8: 16k rows accept as many drafts as full history (0 = full history)
 
     // draft size once the sequence reaches the tiered-KV line (--kv-vram-cells; 0 = n_max). Past it a step
     // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
-    int32_t n_max_tail = 0;
+    int32_t n_max_tail = 4; // adaq8: pairs with GGML_CUDA_PTQ1_MMVQ_MAX=5 (0 = n_max)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+
+    std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
+    int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
 
     common_params_model mparams;
 
@@ -354,8 +363,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (adaq8: q8_0 recipe)
+    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (adaq8: q8_0 recipe)
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -402,7 +411,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -458,7 +467,7 @@ struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
-    int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_ubatch              =   256; // physical batch size for prompt processing (must be >=32 to use BLAS; adaq8: 256 fastest)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -591,8 +600,8 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (adaq8: q8_0 recipe)
+    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (adaq8: q8_0 recipe)
 
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md

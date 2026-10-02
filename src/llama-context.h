@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-mtp-vocab.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -271,6 +272,16 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // parse a `llama-mtp-vocab-v1` map and upload it to the head's device (throws on error)
+    // the last `n_hot` entries become adaptive slots, see llama_draft_vocab_observe/refresh
+    void init_draft_vocab(const char * path, int32_t n_hot);
+
+    // adaptive draft-vocabulary tail (request granularity, must not race with a graph)
+    void    draft_vocab_observe(const llama_token * toks, size_t n);
+    int32_t draft_vocab_refresh();
+    int32_t draft_vocab_n_hot()        const { return draft_vocab.n_hot; }
+    size_t  draft_vocab_n_candidates() const { return draft_vocab.hot.cands.size(); }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -330,6 +341,20 @@ private:
     // [n_outputs][n_capture_layers * n_embd]). populated only when
     // cparams.n_capture_layers > 0 and the model graph filled t_h_capture.
     buffer_view<float> embd_capture = { nullptr, 0 };
+
+    // draft-only vocabulary shortlist (MTP draft contexts): persistent I32 map, compact index -> token id.
+    // Owned here so graphs reference a fixed device tensor instead of uploading an input per eval.
+    struct draft_vocab_info {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor           * ids = nullptr; // [n_sel]
+        ggml_tensor           * head = nullptr; // [n_embd, n_sel] the shortlisted head rows, head's own format
+        std::vector<int32_t>    host;          // same ids, host copy
+        int32_t                 n_hot = 0;     // trailing adaptive slots (0 = fully static map)
+        llama_mtp_hot_vocab     hot;           // ranking policy for those slots
+    };
+
+    draft_vocab_info draft_vocab;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

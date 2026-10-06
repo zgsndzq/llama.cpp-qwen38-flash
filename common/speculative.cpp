@@ -1660,6 +1660,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
+    bool                      prompt_lookup = false;
+    std::vector<llama_tokens> lookup_prompts;
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
@@ -1726,6 +1728,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        const char * lookup_env = std::getenv("LLAMA_DFLASH2_LOOKUP");
+        prompt_lookup           = is_dflash2 && lookup_env && std::strcmp(lookup_env, "1") == 0;
+        if (prompt_lookup) {
+            lookup_prompts.resize(n_seq);
+        }
         if (is_dflash2) {
             if (const char * value = getenv("LLAMA_DFLASH2_BEAM_WIDTH")) {
                 const int width = std::atoi(value);
@@ -1824,6 +1831,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return;
         }
 
+        if (prompt_lookup) {
+            lookup_prompts[seq_id] = prompt;
+        }
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1976,6 +1986,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            if (prompt_lookup && dp.prompt) {
+                const int limit = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                auto      found = common_prompt_lookup_draft(lookup_prompts[seq_id], *dp.prompt, dp.id_last, limit);
+                if (!found.empty() && found.size() >= (size_t) params.n_min) {
+                    *dp.result = std::move(found);
+                    LOG_DBG("DFlash2 prompt lookup: seq=%d tokens=%zu, neural draft skipped\n", seq_id,
+                            dp.result->size());
+                    continue;
+                }
+            }
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.n_past;

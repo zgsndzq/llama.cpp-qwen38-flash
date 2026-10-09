@@ -279,9 +279,35 @@ static __host__ int ptq1_0_pt_rows_per_cta(const int blocks_per_row, const int n
 #define PTQ1_0_PT_ROWS_34 4
 #endif
 
+// 5..8 columns. A speculative verify is exactly 1 + DRAFT_N columns wide, so this branch is the
+// one DRAFT_N=4 lands on (5 columns). Two costs land on it at the same time, both measured here:
+//
+//   rows/item  4 at <=4 columns, 2 at 5+. Every item re-reads the PT activations of ALL columns,
+//              so 5 columns at 2 rows/item move ~2.5x the activation bytes of 4 columns at
+//              4 rows/item. Measured end to end: 4 columns 69.33 t/s, 5 columns ~53 t/s.
+//              Handled by keeping rows/item = 4 for 5+ columns.
+//
+//   registers  cuobjdump -res-usage on this build, ROWS=4, fusion=(0,0) instantiation:
+//              ncols=3 162 | ncols=4 168 | ncols=5 224 | ncols=6 226 | ncols=7 245 | ncols=8 251.
+//              At 128 threads/CTA the resident blocks per SM are 65536/(regs*128): 168 -> 3,
+//              224 -> 2. So one extra column drops the SM from 3 blocks to 2, and 3->4 columns
+//              costs +6 regs while 4->5 costs +56 -- not demand, just ptxas spending slack.
+//              PTQ1_0_PT_MINB_5P = 3 caps ptxas at 170 regs so 5+ columns keep the 3 blocks/SM
+//              the 4-column case already has. Verify with cuobjdump after any change: the
+//              instantiation is mul_mat_vec_ptq1_0_ptILi5ELi4ELb0ELb0E, and STACK/LOCAL must stay 0.
+//
+// Both knobs stay build-time overridable so the two effects can be priced apart without editing
+// this file again:  -DPTQ1_0_PT_ROWS_5P=2 / -DPTQ1_0_PT_MINB_5P=2 restore the original geometry.
+#ifndef PTQ1_0_PT_ROWS_5P
+#define PTQ1_0_PT_ROWS_5P 4
+#endif
+#ifndef PTQ1_0_PT_MINB_5P
+#define PTQ1_0_PT_MINB_5P 3
+#endif
+
 // Same row-per-item rule the launcher instantiates. 4 up to 4 columns, 2 beyond (8 spills).
 static constexpr __host__ __device__ int ptq1_0_pt_rows_per_item(const int ncols_dst) {
-    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : 2);
+    return ncols_dst <= 2 ? 4 : (ncols_dst <= 4 ? PTQ1_0_PT_ROWS_34 : PTQ1_0_PT_ROWS_5P);
 }
 
 // Bytes the launch requests: one fp32 partial per (column, row, K block + 1 pad) for the CTA,
@@ -293,7 +319,7 @@ static __host__ size_t ptq1_0_pt_smem_bytes(const int blocks_per_row, const int 
 }
 
 template <int ncols, int ROWS, bool has_fusion, bool has_gate>
-__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : 2)))
+__launch_bounds__(PTQ1_0_PT_THREADS, (ncols <= 2 ? 4 : (ncols <= 4 ? PTQ1_0_PT_MINB_34 : PTQ1_0_PT_MINB_5P)))
 static __global__ void mul_mat_vec_ptq1_0_pt(
         const void * vx_, const void * vy_, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_,

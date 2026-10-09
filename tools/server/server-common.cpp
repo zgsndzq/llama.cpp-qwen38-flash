@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-session.h"
 
 #include <random>
 #include <sstream>
@@ -1369,6 +1370,56 @@ json oaicompat_chat_params_parse(
     }
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
+
+    // Server-side conversation state -- the OpenAI Responses "previous_response_id" contract.
+    // The assistant turn we produced last time is kept as raw tokens; re-rendering it from text is
+    // not byte-identical (the template inserts a newline inside the thinking block) and would
+    // invalidate the entire prompt cache. Hand the caller the exact prefix plus the delta prompt.
+    const std::string prev_response_id = json_value(body, "previous_response_id", std::string());
+    if (!prev_response_id.empty() && messages.is_array() && !messages.empty()) {
+        llama_tokens prefix;
+        json         stored_messages;
+        int32_t      n_consumed = 0;
+
+        if (server_sessions().get(prev_response_id, prefix, stored_messages, n_consumed) &&
+            !prefix.empty() && stored_messages.is_array() && !stored_messages.empty() &&
+            messages.size() >= stored_messages.size() &&
+            n_consumed > 0 && (size_t) n_consumed < inputs.messages.size()) {
+            bool is_extension = true;
+            for (size_t i = 0; is_extension && i < stored_messages.size(); i++) {
+                if (messages.at(i) != stored_messages.at(i)) {
+                    is_extension = false;
+                }
+            }
+
+            if (is_extension) {
+                // cut the freshly rendered prompt at the point where our decoded tokens stop.
+                // note: the assistant turn is rendered here only to locate the cut -- its text is
+                // thrown away, because the real (generated) tokens are already inside `prefix`.
+                common_chat_templates_inputs prev_inputs = inputs;
+                prev_inputs.messages.assign(inputs.messages.begin(), inputs.messages.begin() + n_consumed);
+                prev_inputs.add_generation_prompt  = false;
+                prev_inputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+
+                const std::string   prev_prompt = common_chat_templates_apply(opt.tmpls.get(), prev_inputs).prompt;
+                const std::string & full_prompt = chat_params.prompt;
+
+                // the template renders messages in order, so the consumed history is a prefix of the
+                // new prompt -- when it is not, we keep the plain full-render path
+                if (!prev_prompt.empty() && full_prompt.size() > prev_prompt.size() &&
+                    full_prompt.compare(0, prev_prompt.size(), prev_prompt) == 0) {
+                    // the exact cut is resolved by the caller, which owns the vocabulary: generation
+                    // stops right after the end-of-turn token, while the template keeps rendering the
+                    // glue (a newline, typically) that follows it
+                    llama_params["session_prefix_tokens"] = prefix;
+                    llama_params["session_head_prompt"]   = prev_prompt;
+
+                    SRV_INF("session %s: %zu decoded tokens + %zu new messages\n",
+                            prev_response_id.c_str(), prefix.size(), inputs.messages.size() - n_consumed);
+                }
+            }
+        }
+    }
 
     // Reasoning budget: pass parameters through to sampling layer
     {

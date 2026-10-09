@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-session.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -49,6 +50,31 @@ static common_speculative_output_limits server_output_limits(const common_params
 
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
+    return result;
+}
+
+// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // the token is discarded - the call is what advances the sampler over this position
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
     return result;
 }
 
@@ -213,6 +239,9 @@ struct server_slot {
 
 
     llama_tokens spec_draft;
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -402,7 +431,7 @@ struct server_slot {
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
+    // (MTP supports splitting 鈥?uses task->need_embd() not need_embd())
     bool can_split() const {
         GGML_ASSERT(task);
 
@@ -434,6 +463,11 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f;
     }
 
     void add_token(const completion_token_output & token) {
@@ -2078,6 +2112,16 @@ private:
     void send_final_response(server_slot & slot) {
         slot.draft_vocab_observe_generated();
 
+        // server-side conversation state: remember exactly what this turn decoded, so the next
+        // request can continue from it instead of re-rendering (and thereby breaking) the history
+        if (!slot.task->is_child() && !slot.task->params.session_id.empty() && slot.stats.n_gen > 0 &&
+            slot.task->params.session_messages.is_array() && !slot.prompt.tokens.has_mtmd) {
+            server_sessions().put(slot.task->params.session_id,
+                                  slot.prompt.tokens.get_tokens(),
+                                  slot.task->params.session_messages,
+                                  slot.task->params.session_n_consumed);
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3028,6 +3072,9 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    slot.spec_draft_q.clear();
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -3047,6 +3094,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        const bool spec_reject = slot.use_spec_rejection();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3054,6 +3103,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                         };
 
                         drafting.push_back(&slot);
@@ -3982,7 +4034,21 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+
+                // drafters that fill no distribution leave spec_draft_q empty and fall back to sample-and-match
+                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                std::vector<llama_token> accepted;
+                if (slot.spec_is_replay && use_rejection) {
+                    // the draft was already accepted before a checkpoint restore - re-accept it rather than
+                    // verify again, which would draw from the rng a second time
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4334,6 +4400,51 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
+
+        // Server-side conversation state (see server-session.h). session_prefix_tokens is the exact
+        // token sequence the model already decoded for this conversation; re-rendering it from text
+        // is not byte-identical and would throw the prompt cache away. The cut is located on the
+        // token level: generation stops right after the end-of-turn token, while the template keeps
+        // rendering the glue that follows it, so the delta has to start at the end-of-turn token.
+        json prompt_tokens_override;
+        if (data.contains("session_prefix_tokens") && data.contains("session_head_prompt")) {
+            if (ctx_server.mctx == nullptr) {
+                const llama_vocab * vocab = ctx_server.vocab;
+
+                const llama_tokens head = tokenize_mixed(vocab, data.at("session_head_prompt"), false, true);
+                const llama_tokens full = tokenize_mixed(vocab, prompt,                      false, true);
+
+                int i_eog = -1;
+                for (int i = (int) head.size() - 1; i >= 0; i--) {
+                    if (llama_vocab_is_eog(vocab, head[i])) {
+                        i_eog = i;
+                        break;
+                    }
+                }
+
+                if (i_eog >= 0 && full.size() > (size_t) i_eog &&
+                    std::equal(head.begin(), head.begin() + i_eog + 1, full.begin())) {
+                    llama_tokens all = data.at("session_prefix_tokens").get<llama_tokens>();
+
+                    // the stored prefix may or may not already end on the end-of-turn token
+                    const size_t cut      = (!all.empty() && all.back() == head[i_eog]) ? (size_t) i_eog + 1 : (size_t) i_eog;
+                    const size_t n_cached = all.size();
+
+                    all.insert(all.end(), full.begin() + cut, full.end());
+
+                    prompt_tokens_override = json(all);
+
+                    SRV_INF("session: continuing from %zu decoded tokens, %zu new (cut at %zu)\n",
+                            n_cached, all.size() - n_cached, cut);
+                } else {
+                    SRV_WRN("%s\n", "session: could not locate the turn boundary - falling back to a full prompt");
+                }
+            } else {
+                SRV_WRN("%s\n", "session: previous_response_id ignored while a multimodal projector is loaded");
+            }
+        }
+        const json & prompt_effective = prompt_tokens_override.is_null() ? prompt : prompt_tokens_override;
+
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
         //SRV_DBG("Prompt: %s\n", prompt.is_string() ? prompt.get<std::string>().c_str() : prompt.dump(2).c_str());
 
@@ -4355,7 +4466,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt_effective, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -4378,6 +4489,24 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
+
+            // server-side conversation state: publish this turn under the response id so that the
+            // next request can continue from these exact tokens instead of re-rendering the history
+            if (data.contains("messages") && data.at("messages").is_array() && !data.at("messages").empty() &&
+                !completion_id.empty()) {
+                const auto & msgs      = data.at("messages");
+                const auto   last_role = msgs.back().is_object()
+                    ? json_value(msgs.back(), "role", std::string())
+                    : std::string();
+
+                task.params.session_id       = completion_id;
+                task.params.session_messages = msgs;
+
+                // the reply we are about to generate is not a message yet: when this request ends on
+                // a user/tool turn, our token sequence will cover one more message than was sent
+                task.params.session_n_consumed = (int32_t) msgs.size() +
+                    ((last_role == "user" || last_role == "tool" || last_role == "function") ? 1 : 0);
+            }
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;

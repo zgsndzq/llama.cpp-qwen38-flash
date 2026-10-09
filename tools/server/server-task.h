@@ -84,6 +84,13 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // server-side conversation state (OpenAI Responses "previous_response_id"):
+    // the response id this turn publishes, the `messages` it was built from, and the index of the
+    // first message that its decoded token sequence does not cover any more
+    std::string        session_id;
+    json               session_messages;
+    int32_t            session_n_consumed = 0;
+
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;

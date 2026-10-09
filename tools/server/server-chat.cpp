@@ -7,9 +7,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
     }
-    if (!json_value(response_body, "previous_response_id", std::string{}).empty()) {
-        throw std::invalid_argument("llama.cpp does not support 'previous_response_id'.");
-    }
+    // "previous_response_id" is the OpenAI Responses contract for server-side conversation state.
+    // It is implemented by the server itself (see server-session.h) and the field is simply
+    // forwarded, so that oaicompat_chat_params_parse() can splice in the tokens we already decoded
+    // instead of re-rendering (and thereby invalidating) the history.
 
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;

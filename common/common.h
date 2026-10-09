@@ -335,6 +335,20 @@ struct common_params_speculative_draft {
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
+    // minimum number of draft tokens that p_min is not allowed to cut. A bare p_min lets the very first step
+    // abort the whole chain and drop back to plain decoding while the fixed draft cost is still paid, which
+    // measured as a ~2x slowdown; with a keep floor p_min only trims the deep, already-unlikely steps.
+    // 0 keeps the historical behavior (no floor).
+    int32_t p_min_keep = 0;
+
+    // the draft samples its own distribution q, and rejection sampling makes the output exactly p for any q,
+    // so q is a free variable that only moves the acceptance rate. This multiplies the request temperature
+    // for the draft alone: below 1 sharpens q and accepts more often, at zero cost to the output.
+    float temp_scale = 1.0f;
+
+    // size of the draft's shortlist, i.e. the support of q. The draft head samples from its own top-k.
+    int32_t top_k = 10;
+
     // stop drafting once the sequence is this long (0 = never). Measured when a deep verify batch ran on the
     // vector FA kernel and the draft context grew with the conversation (Bonsai 2 27B on a 4070: +85% at zero
     // depth, even near 24k, -30% at 64k). With quantized-KV decode on the MMA FA kernel and n_window below,
@@ -355,6 +369,8 @@ struct common_params_speculative_draft {
 
     std::string vocab_map; // draft-only vocabulary shortlist map for the MTP draft head (empty = full vocabulary)
     int32_t vocab_hot = 0; // trailing entries of that map kept adaptive: repointed at ids seen in recent requests
+
+    bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
     common_params_model mparams;
 

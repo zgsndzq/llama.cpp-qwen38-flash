@@ -332,6 +332,10 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.kq_mask_packed = params.kq_mask_packed && cparams.flash_attn && !model.hparams.use_alibi;
+    if (params.kq_mask_packed && !cparams.kq_mask_packed) {
+        LLAMA_LOG_WARN("%s: kq_mask_packed requested but needs flash attention and no ALiBi; using the f16 mask\n", __func__);
+    }
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -3982,6 +3986,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.path_kv_mean_center         =*/ nullptr,
         /*.n_kv_vram_cells             =*/ 0,
+        /*.kq_mask_packed              =*/ false,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

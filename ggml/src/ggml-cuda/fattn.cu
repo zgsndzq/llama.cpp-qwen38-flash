@@ -615,8 +615,49 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 // ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type)
 void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream);
 
+// Packed KQ mask (GGML_TYPE_I32, 32 cells per word, bit set = attend) expanded to the f16 form the kernels read,
+// into a pool buffer sized by this op's actual KV length. The reserved input tensor is 16x smaller than an f16
+// mask; the f16 copy exists only for the duration of the op. (A native packed read in the tensor-core kernel is
+// the next step; this keeps every kernel correct meanwhile.)
+static __global__ void expand_kq_mask_bits(const uint32_t * __restrict__ bits, half * __restrict__ out, const int64_t n_words_total) {
+    const int64_t w = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (w >= n_words_total) {
+        return;
+    }
+    const uint32_t v = bits[w];
+    half * o = out + w*32;
+    const half keep = __float2half(0.0f), drop = __float2half(-INFINITY);
+#pragma unroll
+    for (int b = 0; b < 32; ++b) {
+        o[b] = (v >> b) & 1u ? keep : drop;
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    ggml_tensor * mask_in = dst->src[3];
+    ggml_tensor mask_f16;
+    ggml_cuda_pool_alloc<half> mask_buf(ctx.pool());
+    // the tensor-core kernel reads packed bits natively; the vec and tile kernels get the expanded f16 copy
+    const best_fattn_kernel best_for_mask = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (mask_in && mask_in->type == GGML_TYPE_I32 && best_for_mask != BEST_FATTN_KERNEL_MMA_F16) {
+        const int64_t n_words = mask_in->ne[0];
+        const int64_t rows    = mask_in->ne[1]*mask_in->ne[2]*mask_in->ne[3];
+        mask_buf.alloc(n_words*32*rows);
+        const int64_t total = n_words*rows;
+        expand_kq_mask_bits<<<(unsigned) ((total + 255)/256), 256, 0, ctx.stream()>>>((const uint32_t *) mask_in->data, mask_buf.get(), total);
+        mask_f16 = *mask_in;
+        mask_f16.type  = GGML_TYPE_F16;
+        mask_f16.ne[0] = n_words*32;
+        mask_f16.nb[0] = sizeof(half);
+        mask_f16.nb[1] = mask_f16.ne[0]*sizeof(half);
+        mask_f16.nb[2] = mask_f16.nb[1]*mask_f16.ne[1];
+        mask_f16.nb[3] = mask_f16.nb[2]*mask_f16.ne[2];
+        mask_f16.data  = mask_buf.get();
+        mask_f16.view_src = nullptr;
+        dst->src[3] = &mask_f16;
+    }
+    struct restore_mask { ggml_tensor * dst; ggml_tensor * mask; ~restore_mask() { dst->src[3] = mask; } } restore{dst, mask_in};
 
     // K/V in a tiered buffer whose host tail this op reaches: copy the used host rows into the VRAM staging
     // buffer with the copy engine and point K/V at the all-VRAM alias of the same range for this op. Prefill

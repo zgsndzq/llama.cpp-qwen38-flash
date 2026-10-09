@@ -402,6 +402,11 @@ extern "C" {
         // once a sequence is that deep. Output is identical to an all-device cache. 0 = all in device memory.
         uint32_t n_kv_vram_cells;
 
+        // packed KQ mask [EXPERIMENTAL]: with flash attention, build the attention mask as one bit per
+        // (cell, token) instead of an f16 value, 16x less memory (the f16 mask is n_ctx x n_ubatch x 2 bytes,
+        // reserved at the full context: 256 MiB per 512 tokens of micro-batch at 262k). Not with ALiBi.
+        bool kq_mask_packed;
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

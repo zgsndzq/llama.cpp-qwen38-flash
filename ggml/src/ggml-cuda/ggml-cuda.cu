@@ -694,6 +694,32 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
     return std::unique_ptr<ggml_cuda_pool>(new ggml_cuda_pool_leg(device));
 }
 
+// GGML_CUDA_SHARED_POOL=1: one transient pool per device and stream for the whole process instead of one per
+// backend instance. llama.cpp creates a backend instance per llama_context, so a speculative draft context carries
+// a second pool whose high-water mark is never returned; sharing makes the two high-water marks overlap instead of
+// adding up. The pool is a LIFO stack, so this is only valid when one thread computes on the device at a time
+// (llama-server does; two contexts computing concurrently from different threads would corrupt it). The pools are
+// leaked on purpose: static destruction may run after the CUDA driver is torn down. Experimental; off by default.
+bool ggml_cuda_shared_pool_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_SHARED_POOL") != nullptr;
+    return enabled;
+}
+
+ggml_cuda_pool & ggml_cuda_shared_pool(int device, int stream_no) {
+    static std::mutex mutex;
+    static ggml_cuda_pool * pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    ggml_cuda_pool * p = pools[device][stream_no];
+    if (p == nullptr) {
+        std::lock_guard<std::mutex> lock(mutex);
+        p = pools[device][stream_no];
+        if (p == nullptr) {
+            p = ggml_backend_cuda_context::new_pool_for_device(device, stream_no).release();
+            pools[device][stream_no] = p;
+        }
+    }
+    return *p;
+}
+
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
 // this lock is used to ensure that no cuBLAS handle is destroyed while a graph is being captured
 

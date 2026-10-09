@@ -51,6 +51,7 @@ struct llama_cparams {
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool kq_mask_packed;   // flash-attention KQ mask as packed bits (GGML_TYPE_I32, 32 cells per word): 16x less memory than f16
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)

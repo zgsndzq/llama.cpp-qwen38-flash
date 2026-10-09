@@ -8486,6 +8486,16 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// One mask value for KV cell `ic` of a mask row: f16 values (scaled by the ALiBi slope) or, for the packed mask
+// (GGML_TYPE_I32, 32 cells per word, bit set = attend), 0 / -inf from the bit.
+static inline float ggml_fa_mask_value(const struct ggml_tensor * mask, const char * row, int64_t ic, float slope) {
+    if (mask->type == GGML_TYPE_I32) {
+        const uint32_t w = ((const uint32_t *) row)[ic >> 5];
+        return (w >> (ic & 31)) & 1u ? 0.0f : -INFINITY;
+    }
+    return slope*GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[ic]);
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8593,7 +8603,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+        const char * mp = mask ? ((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8611,7 +8621,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? ggml_fa_mask_value(mask, mp, ic, slope) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8874,9 +8884,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const char * mp_row = (const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3];
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = ggml_fa_mask_value(mask, mp_row, ic + tk, slope);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9141,7 +9151,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_avx512(
     float M[GGML_FA_DEC_MAX_G];
     float S[GGML_FA_DEC_MAX_G];
     float slope[GGML_FA_DEC_MAX_G];
-    const ggml_fp16_t * mp[GGML_FA_DEC_MAX_G];
+    const char * mp[GGML_FA_DEC_MAX_G];
 
     for (int64_t ik2 = 0; ik2 < nek2; ++ik2) {
         for (int64_t j = 0; j < G; ++j) {
@@ -9154,7 +9164,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_avx512(
             M[j] = -INFINITY;
             S[j] = 0.0f;
             slope[j] = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
-            mp[j] = mask ? (const ggml_fp16_t *) ((const char *) mask->data + (h % mask->ne[2])*mask->nb[2]) : NULL;
+            mp[j] = mask ? ((const char *) mask->data + (h % mask->ne[2])*mask->nb[2]) : NULL;
         }
 
         for (int64_t ic = ic_start; ic < ic_end; ic += T) {
@@ -9180,7 +9190,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_decode_avx512(
                     sc[t] = -INFINITY;
                 }
                 for (int t = 0; t < nt; ++t) {
-                    const float mv = mp[j] ? slope[j]*GGML_CPU_FP16_TO_FP32(mp[j][ic + t]) : 0.0f;
+                    const float mv = mp[j] ? ggml_fa_mask_value(mask, mp[j], ic + t, slope[j]) : 0.0f;
                     if (mv == -INFINITY) {
                         continue;
                     }

@@ -2479,6 +2479,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_VRAM_CELLS"));
     add_opt(common_arg(
+        {"--kq-mask-packed"},
+        "flash attention: build the KQ mask as one bit per (cell, token) instead of f16 (16x less memory; the f16\n"
+        "mask is n_ctx x n_ubatch x 2 bytes reserved at the full context). Needs flash attention, not ALiBi.",
+        [](common_params & params) {
+            params.kq_mask_packed = true;
+        }
+    ).set_env("LLAMA_ARG_KQ_MASK_PACKED"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

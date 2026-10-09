@@ -3646,6 +3646,20 @@ common_speculative_init_result::common_speculative_init_result(
         }
     }
 
+    // LLAMA_MTP_DRAFT_UBATCH=N: a smaller micro-batch for the MTP draft context. Its graph is one layer, but its
+    // compute buffer is reserved for n_ubatch rows (~300 MiB at 1024 on a 27B head), VRAM that a 12 GB card would
+    // rather spend on K/V cells. Catch-up rows still arrive in batches of n_batch and split into ubatches as any
+    // prompt does. Experimental (DECISIONS.md, draft-context VRAM); unset = unchanged.
+    if (spec_mtp) {
+        if (const char * s = std::getenv("LLAMA_MTP_DRAFT_UBATCH")) {
+            const int v = std::atoi(s);
+            if (v >= 32 && (uint32_t) v < cparams.n_ubatch) {
+                LOG_INF("%s: MTP draft context n_ubatch %u -> %d (LLAMA_MTP_DRAFT_UBATCH)\n", __func__, cparams.n_ubatch, v);
+                cparams.n_ubatch = (uint32_t) v;
+            }
+        }
+    }
+
     // n_rs_seq stays as common_context_params_to_llama set it: the draft context needs the same rollback window as the target, with n_rs_seq == 0 its seq_rm fails silently on partial acceptance and keeps stale positions
     cparams.ctx_other = ctx_tgt;
 

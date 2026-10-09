@@ -39,7 +39,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t mask_packed);   // 1: the mask is GGML_TYPE_I32, 32 KV cells per word, bit set = attend
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -661,19 +662,23 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
     }
 }
 
-template <int ncols1>
+// packed = the mask is GGML_TYPE_I32 (32 cells per word, bit set = attend): mask_ptr then points at words and
+// s31 / s33 are word strides; a tile is fully masked when its FATTN_KQ_STRIDE/32 words are all zero.
+template <int ncols1, bool packed = false>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
         const half2 * mask_ptr, int * KV_max_ptr, const int ne30, const int64_t s31, const int64_t s33) {
-    const half2 * GGML_CUDA_RESTRICT mask   = mask_ptr;
-    int         * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
+    const half2    * GGML_CUDA_RESTRICT mask   = mask_ptr;
+    const uint32_t * GGML_CUDA_RESTRICT mask_w = (const uint32_t *) mask_ptr;
+    int            * GGML_CUDA_RESTRICT KV_max = KV_max_ptr;
 
     const int ne31     = gridDim.x;
     const int tid      = threadIdx.x;
     const int sequence = blockIdx.y;
     const int jt       = blockIdx.x;
 
-    mask += sequence*s33 + jt*ncols1*s31;
+    mask   += sequence*s33 + jt*ncols1*s31;
+    mask_w += sequence*s33 + jt*ncols1*s31;
 
     __shared__ int buf_iw[WARP_SIZE];
     if (tid < WARP_SIZE) {
@@ -688,8 +693,13 @@ static __global__ void flash_attn_mask_to_KV_max(
 
 #pragma unroll
         for (int j = 0; j < ncols1; ++j) {
-            const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
-            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            if constexpr (packed) {
+                const uint32_t w = tid < FATTN_KQ_STRIDE/32 ? mask_w[j*s31 + KV_max_sj/32 + tid] : 0u;
+                all_inf = all_inf && int(w == 0u);
+            } else {
+                const float2 tmp = __half22float2(mask[j*s31 + KV_max_sj/2 + tid]);
+                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+            }
         }
 
         all_inf = warp_reduce_all(all_inf);
@@ -994,7 +1004,8 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
+    const bool mask_packed = mask && mask->type == GGML_TYPE_I32;   // only the tensor-core kernel reads it natively (fattn.cu)
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1092,8 +1103,9 @@ void launch_fattn(
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
     if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
-        const int64_t s31 = mask->nb[1] / sizeof(half2);
-        const int64_t s33 = mask->nb[3] / sizeof(half2);
+        const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
+        const int64_t s31 = mask->nb[1] / es;
+        const int64_t s33 = mask->nb[3] / es;
 
         const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
@@ -1103,8 +1115,13 @@ void launch_fattn(
 
         KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
-            (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        if (mask_packed) {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true>, launch_params,
+                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, false>, launch_params,
+                (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1231,7 +1248,8 @@ void launch_fattn(
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        mask_packed ? 1 : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -609,6 +609,7 @@ struct common_params {
 
     // tiered KV cache: cells past this many live in pinned host memory (0 = all in device memory)
     int32_t n_kv_vram_cells = 0;
+    bool    kq_mask_packed  = false; // packed (1-bit) flash-attention mask, see llama_context_params
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

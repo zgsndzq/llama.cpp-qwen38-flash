@@ -1620,6 +1620,10 @@ struct ggml_cuda_fwht_q8_context {
     }
 };
 
+// GGML_CUDA_SHARED_POOL=1: process-wide transient pool per device/stream (see ggml-cuda.cu)
+bool ggml_cuda_shared_pool_enabled();
+ggml_cuda_pool & ggml_cuda_shared_pool(int device, int stream_no);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1735,6 +1739,9 @@ struct ggml_backend_cuda_context {
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
     ggml_cuda_pool & pool(int device) {
+        if (ggml_cuda_shared_pool_enabled()) {
+            return ggml_cuda_shared_pool(device, curr_stream_no);
+        }
         if (pools[device][curr_stream_no] == nullptr) {
             pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
         }

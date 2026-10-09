@@ -37,10 +37,13 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // flash attention requires an f16 mask, or the packed form (GGML_TYPE_I32, 32 cells per word) when enabled:
+    // 16x less memory, used for micro-batches of 32+ tokens per stream (the tensor-core kernels); smaller
+    // batches keep the f16 mask, which is tiny there.
+    const bool packed = cparams.flash_attn && cparams.kq_mask_packed && n_tokens/n_stream >= 32 && n_kv % 32 == 0;
+    const auto type = packed ? GGML_TYPE_I32 : cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, type, packed ? n_kv/32 : n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
     ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -58,7 +61,7 @@ static bool can_reuse_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= (kq_mask->type == GGML_TYPE_I32 ? kq_mask->ne[0]*32 == n_kv : kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);
@@ -905,7 +908,7 @@ static bool dsv4_can_reuse_raw_kq_mask(
 
     bool res = true;
 
-    res &= (kq_mask->ne[0] == n_kv);
+    res &= (kq_mask->type == GGML_TYPE_I32 ? kq_mask->ne[0]*32 == n_kv : kq_mask->ne[0] == n_kv);
     res &= (kq_mask->ne[1] == n_tokens/n_stream);
     res &= (kq_mask->ne[2] == 1);
     res &= (kq_mask->ne[3] == n_stream);

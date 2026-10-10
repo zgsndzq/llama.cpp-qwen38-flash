@@ -11,7 +11,26 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
-    if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
+    // adaq8: upstream #189 ("avoid short-query MMA FA crash with quantized V") says a quantized V cache with a
+    // short query (2 < Q <= 4, i.e. a speculative verify batch) must not use the in-place q4_0/q8_0 kernel, and
+    // sends it to mma_f16_case<.., 64/ncols2, ncols2> instead. That call drops type_KV, so launch_fattn sets
+    // need_f16_KV: the whole K/V cache is dequantised into a scratch buffer on every pass, and the Q tile is 64
+    // wide for 3 or 4 real rows.
+    //
+    // In this tree the guard is redundant and it takes the in-place path away exactly where it matters most: the
+    // verify step, the hottest flash attention call of an MTP decode. ggml_cuda_flash_attn_ext_mma_f16 only enters
+    // a quantized type_KV instantiation after ggml_cuda_fattn_mma_kv_native_supported() passed - matching K/V
+    // types, q4_0/q8_0, D = 128/256, word-aligned rows - and routes everything else to the F16 instance anyway,
+    // so there is nothing left for #189 to protect here.
+    // Measured 2026-10-10, same engine and prompt, only this switch flipped: corrupt output at 24.9 tok/s with
+    // #189, clean output at 27.1 tok/s without it.
+    //
+    // 0 (default) = ignore #189, keep the in-place kernel. 1 = upstream behaviour, for A/B only.
+    static const int shortq_mma = [] {
+        const char * e = getenv("GGML_CUDA_FA_SHORTQ_MMA");
+        return e ? atoi(e) : 0;
+    }();
+    if (shortq_mma != 0 && turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
         return;
     }

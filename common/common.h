@@ -249,6 +249,12 @@ struct common_params_sampling {
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
     float   top_n_sigma        = -1.00f; // -1.0 = disabled
+    // adaq8: upstream #313 keeps only the top-k candidates instead of building the whole vocabulary.
+    // The speculative rejection sampler reads the full target distribution, so it cannot use that.
+    //   0 = off  : always build the full candidate array
+    //   1 = auto : fast top-k everywhere except the speculative rejection path (default)
+    //   2 = on   : fast top-k everywhere (upstream #313 behaviour)
+    int32_t sampler_fast_topk  = 1;
     float   mirostat_tau       = 5.00f;  // target entropy
     float   mirostat_eta       = 0.10f;  // learning rate
     bool    ignore_eos         = false;

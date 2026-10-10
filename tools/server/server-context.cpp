@@ -2361,10 +2361,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // adaq8: upstream #312 hands the buffers of an evicted checkpoint to the new one.
+        // LLAMA_CKPT_REUSE=0 restores the pre-#312 behaviour (fresh, zero-filled buffers).
+        static const bool ckpt_reuse = [] {
+            const char * e = getenv("LLAMA_CKPT_REUSE");
+            return !e || atoi(e) != 0;
+        }();
+
         // the buffers of an evicted checkpoint go to the new one: a fresh vector is zero-filled by resize()
         std::vector<uint8_t> spare_tgt;
         std::vector<uint8_t> spare_dft;
         const auto keep_spare = [&](common_prompt_checkpoint & ckpt) {
+            if (!ckpt_reuse) {
+                return;
+            }
             spare_tgt = std::move(ckpt.data_tgt);
             spare_dft = std::move(ckpt.data_dft);
         };

@@ -4112,14 +4112,24 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                // a lookup drafter (ngram-*) copies text already in the context, so it gets its own,
+                // usually larger cap (--spec-lookup-n-max); the model drafter keeps --spec-draft-n-max
+                const auto dtype = impl.get()->type;
+                const bool is_lookup = dtype == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE || dtype == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K ||
+                                       dtype == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V || dtype == COMMON_SPECULATIVE_TYPE_NGRAM_MOD ||
+                                       dtype == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                const int32_t cap = is_lookup && dp.n_max_lookup > 0 ? dp.n_max_lookup : dp.n_max;
+                if (cap > 0) {
+                    if (!result.empty() && (int) result.size() > cap) {
+                        SPC_DBG("truncating draft to %d tokens\n", cap);
+                        result.resize(cap);
 
-                        // the candidates are one per drafted token and must be cut with them
-                        if (dp.result_q) {
-                            dp.result_q->resize(dp.n_max);
+                        // the candidates are one per drafted token and must be cut with them, but only when the
+                        // drafter actually filled them: a lookup drafter yields no distribution, and resizing an
+                        // EMPTY result_q here would push the server onto the rejection path with empty probability
+                        // rows and reject nearly every draft.
+                        if (dp.result_q && !dp.result_q->empty()) {
+                            dp.result_q->resize(cap);
                         }
                     }
                 }

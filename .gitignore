@@ -153,3 +153,7 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# ada fork: machine-local values, and our build logs
+build.local.bat
+_buildlogs/

@@ -45,7 +45,7 @@ std::string rm_dashes(const std::string & s) {
 std::vector<std::pair<std::string, std::string>> read_ini(const std::string & path) {
     std::ifstream file(path);
     if (!file.good()) {
-        throw std::runtime_error("adaq8: cannot open feature file: " + path);
+        throw std::runtime_error("ada: cannot open feature file: " + path);
     }
 
     std::vector<std::pair<std::string, std::string>> out;
@@ -62,14 +62,14 @@ std::vector<std::pair<std::string, std::string>> read_ini(const std::string & pa
 
         const auto eq = line.find('=');
         if (eq == std::string::npos) {
-            LOG_WRN("adaq8: feature file, line without '=' ignored: %s\n", line.c_str());
+            LOG_WRN("ada: feature file, line without '=' ignored: %s\n", line.c_str());
             continue;
         }
 
         const std::string key = strip(line.substr(0, eq));
         const std::string val = strip(line.substr(eq + 1));
         if (key.empty()) {
-            LOG_WRN("adaq8: feature file, empty key ignored\n");
+            LOG_WRN("ada: feature file, empty key ignored\n");
             continue;
         }
         out.emplace_back(key, val);
@@ -115,14 +115,14 @@ int common_params_apply_features_file(const std::string & path,
         try {
             if (is_env_name(key) && key_to_opt.find(key) == key_to_opt.end()) {
                 common_set_env(key, value);
-                LOG_INF("adaq8: feature env   %s = %s\n", key.c_str(), value.c_str());
+                LOG_INF("ada: feature env   %s = %s\n", key.c_str(), value.c_str());
                 ++applied;
                 continue;
             }
 
             const auto it = key_to_opt.find(rm_dashes(key));
             if (it == key_to_opt.end()) {
-                LOG_WRN("adaq8: feature '%s' is not known to this build, ignored\n", key.c_str());
+                LOG_WRN("ada: feature '%s' is not known to this build, ignored\n", key.c_str());
                 ++ignored;
                 continue;
             }
@@ -138,25 +138,25 @@ int common_params_apply_features_file(const std::string & path,
             } else if (opt.handler_void) {
                 // a bare switch has no value, so the value decides whether it is on
                 if (!common_arg_utils::is_truthy(value)) {
-                    LOG_INF("adaq8: feature off   %s\n", key.c_str());
+                    LOG_INF("ada: feature off   %s\n", key.c_str());
                     continue;
                 }
                 opt.handler_void(params);
             } else {
-                LOG_WRN("adaq8: feature '%s' has no usable handler, ignored\n", key.c_str());
+                LOG_WRN("ada: feature '%s' has no usable handler, ignored\n", key.c_str());
                 ++ignored;
                 continue;
             }
 
-            LOG_INF("adaq8: feature set   %s = %s\n", key.c_str(), value.c_str());
+            LOG_INF("ada: feature set   %s = %s\n", key.c_str(), value.c_str());
             ++applied;
         } catch (const std::exception & e) {
-            LOG_WRN("adaq8: feature '%s' = '%s' could not be applied (%s), ignored\n",
+            LOG_WRN("ada: feature '%s' = '%s' could not be applied (%s), ignored\n",
                     key.c_str(), value.c_str(), e.what());
             ++ignored;
         }
     }
 
-    LOG_INF("adaq8: feature file %s -> %d applied, %d ignored\n", path.c_str(), applied, ignored);
+    LOG_INF("ada: feature file %s -> %d applied, %d ignored\n", path.c_str(), applied, ignored);
     return applied;
 }

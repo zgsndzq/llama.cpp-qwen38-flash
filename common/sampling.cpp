@@ -284,7 +284,7 @@ std::string common_params_sampling::print() const {
 
 // k > 0 if the sampler chain starts with top-k (every sampler before it does nothing with these settings)
 static int32_t common_sampler_fast_topk(const common_params_sampling & params, bool has_logit_bias) {
-    // adaq8: the switch can force the full candidate array (0 = off)
+    // ada: the switch can force the full candidate array (0 = off)
     if (params.sampler_fast_topk == 0) {
         return 0;
     }
@@ -899,7 +899,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
 
-    // adaq8: this path reads the untruncated target distribution (p_x and the p-q residual below),
+    // ada: this path reads the untruncated target distribution (p_x and the p-q residual below),
     // so the fast top-k candidate array (upstream #313) must stay off unless the user forces it on
     const int32_t fast_topk_saved = gsmpl->fast_topk;
     if (gsmpl->params.sampler_fast_topk != 2) {
@@ -1005,7 +1005,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
         result.push_back(id);
     }
 
-    // adaq8: restore the fast top-k state
+    // ada: restore the fast top-k state
     if (gsmpl->params.sampler_fast_topk != 2) {
         gsmpl->fast_topk = fast_topk_saved;
     }

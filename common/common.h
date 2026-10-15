@@ -228,13 +228,13 @@ struct common_params_sampling {
     int32_t n_prev             = 64;     // number of previous tokens to remember
     int32_t n_probs            = 0;      // if greater than 0, output the probabilities of top n_probs tokens.
     int32_t min_keep           = 0;      // 0 = disabled, otherwise samplers should return at least min_keep tokens
-    int32_t top_k              = 20;     // <= 0 to use vocab size (adaq8: Bonsai serving recipe)
+    int32_t top_k              = 20;     // <= 0 to use vocab size (ada: Bonsai serving recipe)
     float   top_p              = 0.95f;  // 1.0 = disabled
-    float   min_p              = 0.00f;  // 0.0 = disabled (adaq8: Bonsai serving recipe)
+    float   min_p              = 0.00f;  // 0.0 = disabled (ada: Bonsai serving recipe)
     float   xtc_probability    = 0.00f;  // 0.0 = disabled
     float   xtc_threshold      = 0.10f;  // > 0.5 disables XTC
     float   typ_p              = 1.00f;  // typical_p, 1.0 = disabled
-    float   temp               = 0.60f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities (adaq8)
+    float   temp               = 0.60f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities (ada)
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
     int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
@@ -249,7 +249,7 @@ struct common_params_sampling {
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ~ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
     float   top_n_sigma        = -1.00f; // -1.0 = disabled
-    // adaq8: upstream #313 keeps only the top-k candidates instead of building the whole vocabulary.
+    // ada: upstream #313 keeps only the top-k candidates instead of building the whole vocabulary.
     // The speculative rejection sampler reads the full target distribution, so it cannot use that.
     //   0 = off  : always build the full candidate array
     //   1 = auto : fast top-k everywhere except the speculative rejection path (default)
@@ -365,11 +365,11 @@ struct common_params_speculative_draft {
     // them, so its cells are reused, its cache stays small and on the device, and a draft pass costs the same
     // at any depth. The MTP head predicts the next few tokens from recent context: 16k rows accept as many
     // drafts as the full history at 131k.
-    int32_t n_window = 16384; // adaq8: 16k rows accept as many drafts as full history (0 = full history)
+    int32_t n_window = 16384; // ada: 16k rows accept as many drafts as full history (0 = full history)
 
     // draft size once the sequence reaches the tiered-KV line (--kv-vram-cells; 0 = n_max). Past it a step
     // is bound by reading the host tail over PCIe and a wider verify batch reads it once for all columns.
-    int32_t n_max_tail = 4; // adaq8: pairs with GGML_CUDA_PTQ1_MMVQ_MAX=5 (0 = n_max)
+    int32_t n_max_tail = 4; // ada: pairs with GGML_CUDA_PTQ1_MMVQ_MAX=5 (0 = n_max)
 
     // draft size for the lookup drafters (ngram-*; 0 = the same limit as the model drafter). A lookup draft
     // copies text that is already in the context, so a long draft is cheap and usually accepted; the model
@@ -390,8 +390,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (adaq8: q8_0 recipe)
-    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (adaq8: q8_0 recipe)
+    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (ada: q8_0 recipe)
+    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (ada: q8_0 recipe)
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -494,7 +494,7 @@ struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
-    int32_t n_ubatch              =   256; // physical batch size for prompt processing (must be >=32 to use BLAS; adaq8: 256 fastest)
+    int32_t n_ubatch              =   256; // physical batch size for prompt processing (must be >=32 to use BLAS; ada: 256 fastest)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -627,8 +627,8 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
-    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (adaq8: q8_0 recipe)
-    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (adaq8: q8_0 recipe)
+    ggml_type cache_type_k = GGML_TYPE_Q8_0; // KV cache data type for the K (ada: q8_0 recipe)
+    ggml_type cache_type_v = GGML_TYPE_Q8_0; // KV cache data type for the V (ada: q8_0 recipe)
 
     // path to a K-cache mean-centering bias file (GGUF), or empty to disable.
     // only takes effect when cache_type_k == GGML_TYPE_Q4_0; see docs/kv-mean-center.md

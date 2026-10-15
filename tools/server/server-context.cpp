@@ -2361,7 +2361,7 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // adaq8: upstream #312 hands the buffers of an evicted checkpoint to the new one.
+        // ada: upstream #312 hands the buffers of an evicted checkpoint to the new one.
         // LLAMA_CKPT_REUSE=0 restores the pre-#312 behaviour (fresh, zero-filled buffers).
         static const bool ckpt_reuse = [] {
             const char * e = getenv("LLAMA_CKPT_REUSE");

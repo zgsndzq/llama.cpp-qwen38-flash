@@ -772,7 +772,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // config file applies first, so env variables and CLI arguments override it
     common_params_apply_system_config(params, ctx_arg.ex);
 
-    // adaq8: our fork feature file, applied here so that an explicit command-line
+    // ada: our fork feature file, applied here so that an explicit command-line
     // argument still wins over whatever the file says
     {
         const std::string features_path = common_params_find_features_file(argc, argv);
@@ -2038,7 +2038,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sampling().set_env("LLAMA_ARG_TOP_K"));
     add_opt(common_arg(
         {"--features-file"}, "PATH",
-        "adaq8: INI file holding this fork's feature switches. A key shaped like an\n"
+        "ada: INI file holding this fork's feature switches. A key shaped like an\n"
         "environment variable (upper case, digits, underscore) is exported as an environment\n"
         "variable, any other key is an argument name without its leading dashes, for example\n"
         "  spec-draft-sampling = probabilistic\n"
@@ -2047,7 +2047,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--sampler-fast-topk"}, "{auto,on,off}",
-        string_format("adaq8: use the upstream top-k-from-logits fast path (#313). auto = on except in the "
+        string_format("ada: use the upstream top-k-from-logits fast path (#313). auto = on except in the "
                       "speculative rejection sampler, on = upstream behaviour, off = always build the full "
                       "candidate array (default: %s)",
                       params.sampling.sampler_fast_topk == 0 ? "off" : (params.sampling.sampler_fast_topk == 2 ? "on" : "auto")),

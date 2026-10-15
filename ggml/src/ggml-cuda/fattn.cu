@@ -11,7 +11,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
 
-    // adaq8: upstream #189 ("avoid short-query MMA FA crash with quantized V") says a quantized V cache with a
+    // ada: upstream #189 ("avoid short-query MMA FA crash with quantized V") says a quantized V cache with a
     // short query (2 < Q <= 4, i.e. a speculative verify batch) must not use the in-place q4_0/q8_0 kernel, and
     // sends it to mma_f16_case<.., 64/ncols2, ncols2> instead. That call drops type_KV, so launch_fattn sets
     // need_f16_KV: the whole K/V cache is dequantised into a scratch buffer on every pass, and the Q tile is 64

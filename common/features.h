@@ -1,7 +1,7 @@
 #pragma once
 
 //
-// adaq8 - feature file
+// ada - feature file
 //
 // Our fork adds switches on top of upstream: an extra sampling mode, a different
 // flash-attention routing, a tiered KV cache, and a few environment switches that

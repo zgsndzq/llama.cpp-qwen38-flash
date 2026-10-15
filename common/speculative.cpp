@@ -1197,7 +1197,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 // Deferred boundary (MTP doesn't have this issue):
 //   Within a single process() call with n_tokens, we can only write decoder KV for
 //   training pos 0..n_tokens-2. The last training pos (n_tokens-1) needs t_{n_tokens}
-//   which lies *outside* this batch 鈥?it is the token target will sample next or the first token from next ubatch.
+//   which lies *outside* this batch - it is the token target will sample next or the first token from next ubatch.
 //   So the last training pos of each process() call is *deferred* to whichever next call has
 //   the missing token in hand:
 //     - multi-ubatch prefill: the next process()'s first token completes the pair
@@ -1206,10 +1206,10 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //                              (target's freshest sample) to complete the pair
 //
 // Per-seq carry-over state:
-//   pending_g_last    [n_embd_dec]  鈹? the deferred boundary's (g, pos). Set by
-//   pending_pos_last  llama_pos     鈹? process() at end of ubatch (= last row);
+//   pending_g_last    [n_embd_dec]  - the deferred boundary's (g, pos). Set by
+//   pending_pos_last  llama_pos     - process() at end of ubatch (= last row);
 //                                       rebased by accept() to first-non-accepted pos.
-//   verify_g          [N 脳 n_embd_dec] snapshot of process()'s encoder output;
+//   verify_g          [N x n_embd_dec] snapshot of process()'s encoder output;
 //   verify_pos_first  llama_pos         consumed by accept() to recover the right
 //   verify_g_rows     int32_t           pending_g_last row for any n_accepted value.
 //
@@ -1244,8 +1244,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
     // [per-seq] snapshot of the most recent process()'s encoder output
     std::vector<std::vector<float>> verify_g;         // [n_seq][n_rows * n_embd_dec]
-    std::vector<llama_pos>          verify_pos_first; // [n_seq] 鈥?pos of verify_g[seq][0]
-    std::vector<int32_t>            verify_g_rows;    // [n_seq] 鈥?number of rows
+    std::vector<llama_pos>          verify_pos_first; // [n_seq] - pos of verify_g[seq][0]
+    std::vector<int32_t>            verify_g_rows;    // [n_seq] - number of rows
 
     // scratch buffer for concatenated target features [n_tokens, n_embd_enc]
     std::vector<float> features_buf;
@@ -1361,7 +1361,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
         if (pos_max < N - 2) {
-            SPC_WRN("ctx_dft pos_max=%d < N-2=%d 鈥?process() did not run on every prefill ubatch. "
+            SPC_WRN("ctx_dft pos_max=%d < N-2=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 2);
         }
@@ -1457,12 +1457,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // (token[P+1], g_embd[P]). This shifts the token index "left by one" relative to g_embd.
         //
         // Per seq, in order:
-        //   (a) cross-ubatch bridge 鈥?when applicable, write the previously-deferred
+        //   (a) cross-ubatch bridge - when applicable, write the previously-deferred
         //       pos using this ubatch's first token + pending_g_last.
-        //   (b) main write loop 鈥?for k in [beg, end-1], write (token[k+1], g_embd[k])
+        //   (b) main write loop - for k in [beg, end-1], write (token[k+1], g_embd[k])
         //       at pos[k]. The last training pos (k=end) is left unwritten = new
         //       deferred boundary, completed by the next process() or draft() call.
-        //   (c) refresh deferred state 鈥?stash this ubatch's full g_embd into verify_g,
+        //   (c) refresh deferred state - stash this ubatch's full g_embd into verify_g,
         //       update pending_g_last / pending_pos_last to the last row.
         common_batch_clear(batch);
 
@@ -1473,7 +1473,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 continue;
             }
 
-            // cross-ubatch bridge 鈥?complete the prior ubatch's deferred boundary.
+            // cross-ubatch bridge - complete the prior ubatch's deferred boundary.
             // Fires iff all three preconditions hold:
             //   1) pending_pos_last >= 0
             //   2) pending_pos_last + 1 == pos[beg]
@@ -2841,7 +2841,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < n_past
-            // (prompt + accepted prefix) 鈥?nothing in the draft region yet. so reset the
+            // (prompt + accepted prefix) - nothing in the draft region yet. so reset the
             // draft region (the seq_rm lower bound is n_past, leaving the prompt KV intact)
             // and select head i so it rebuilds its own layer's KV there; decoding just the
             // latest token would leave its attention reading cells only another head wrote.

@@ -34,7 +34,9 @@ set "FAQUANTS=all"
 echo CFG_EXIT=%ERRORLEVEL% >> "%LOG%"
 if not exist ..\build\src\build.ninja ( echo NO_NINJA >> "%LOG%" & echo DONE >> "%LOG%" & exit /b 2 )
 echo BUILD_START %DATE% %TIME% >> "%LOG%"
-"%NINJA%" -C ..\build\src -j %JOBS% llama-server llama-bench test-backend-ops >> "%LOG%" 2>&1
+rem llama-quantize is included on purpose: it is how the PTQ1_0 conversion is driven, so a
+rem user who wants to reproduce the quantisation should not need a second build.
+"%NINJA%" -C ..\build\src -j %JOBS% llama-server llama-bench llama-quantize test-backend-ops >> "%LOG%" 2>&1
 echo BUILD_EXIT=%ERRORLEVEL% %DATE% %TIME% >> "%LOG%"
 if exist ..\build\src\bin\llama-server.exe (echo SERVER_OK >> "%LOG%") else (echo SERVER_MISSING >> "%LOG%")
 echo DONE >> "%LOG%"

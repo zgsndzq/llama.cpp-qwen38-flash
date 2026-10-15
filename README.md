@@ -1,4 +1,4 @@
-# ada-q8 — llama.cpp fork for Ternary-Bonsai-2-27B (PTQ1_0 + MTP)
+# ada-ternary — llama.cpp fork for Ternary-Bonsai-2-27B (PTQ1_0 + MTP)
 
 A fork of [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) (`prism`
 branch), which is itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).

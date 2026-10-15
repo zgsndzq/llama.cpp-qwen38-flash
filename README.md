@@ -9,6 +9,48 @@ Upstream baseline: `e8fd209c9` (`grammar: allow schema property order (#347)`).
 Everything upstream has is carried over — this fork adds speed work on top of it.
 The unmodified upstream README is kept as `README.upstream.md`.
 
+## How the product is split
+
+This repository is one half. The scripts a user actually touches are deliberately **not** here,
+because they need to be reviewable and patchable — they used to live only inside a release zip.
+
+| Where | What |
+|---|---|
+| **this repo** | the engine: PTQ1_0 kernels, MTP draft context, the speed work, the build scripts |
+| **[ada-ternary-runtime](https://github.com/zgsndzq/ada-ternary-runtime)** | what you launch: `llmserver.bat` / `llmserver.sh`, **`features.ini`**, `llmchat\`, `maps\` |
+| [Releases](https://github.com/zgsndzq/ada-ternary/releases) | prebuilt engine binaries (`build\bin` + `build\cuda`) |
+| [Hugging Face](https://huggingface.co/SuperLogic/Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km) | the weights |
+
+> ⚠️ **`features.ini` is not in this repository, and it is not compiled into the binary.**
+> `llama-server` has no built-in default path for it — it is picked up at runtime through
+> `--features-file features.ini`. A binary built from this source **without** that file behaves
+> like upstream, not like us. Which switches we ship is decided in the runtime repo, not here.
+
+The two repositories are meant to sit nested, which is the layout the build scripts assume
+(`_build_q8.bat` writes to `..\build\`):
+
+```bat
+git clone https://github.com/zgsndzq/ada-ternary-runtime
+cd ada-ternary-runtime
+git clone https://github.com/zgsndzq/ada-ternary code
+```
+
+## Where are the weights
+
+**Not here.** The gguf files live on Hugging Face:
+
+### 👉 https://huggingface.co/SuperLogic/Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km
+
+| File | Size | Needed for |
+|---|---|---|
+| `Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km.gguf` | 5.79 GB | the model itself |
+| `mmproj-Qwen3.8-27B-Q8_0.gguf` | 0.59 GB | reading images |
+| `SHA256SUMS` | — | verifying the two above |
+
+Measured on the model card's reference machine (RTX 4060 Laptop, 8 GB): **70 t/s** with thinking
+off, **100–200 t/s** in editing mode. Stock llama.cpp cannot load these weights — `PTQ1_0` and
+the MTP draft context exist only in this fork.
+
 ## What is ours
 
 Three layers. All of them are switchable at runtime, so none is hardcoded behaviour:
@@ -23,7 +65,7 @@ Three layers. All of them are switchable at runtime, so none is hardcoded behavi
 
 | | |
 |---|---|
-| OS | Windows x64 |
+| OS | Windows x64, or Linux (plain CMake — see below) |
 | Compiler | MSVC (Visual Studio, any recent version) |
 | CUDA | CUDA Toolkit with `nvcc` — **11.x or newer** |
 | CMake | 3.21+ |
@@ -33,6 +75,8 @@ Three layers. All of them are switchable at runtime, so none is hardcoded behavi
 Nothing else is needed. All third-party code is vendored under `vendor/`.
 
 ## How to build
+
+### Windows
 
 1. Create your machine config from the template and edit it:
 
@@ -67,11 +111,23 @@ Nothing else is needed. All third-party code is vendored under `vendor/`.
    `_build_clean.bat` wipes the build dir first. `_build_merge.bat` is `_build_q8.bat`
    without the FA pin. `_fa_reconfig.bat` re-applies the pin only.
 
-3. Install the runtime:
+3. That is all. The launcher in the runtime package accepts `..\build\src\bin\` directly, so
+   there is usually nothing to copy — it prefers a local build over the prebuilt `..\build\bin\`.
 
-   ```bat
-   xcopy /y ..\build\src\bin\* ..\build\bin\
-   ```
+### Linux
+
+There is no `.sh` build script; use CMake directly. The two flags that are not optional are
+`GGML_CUDA_FA_QUANTS=all` and an explicit `CMAKE_CUDA_ARCHITECTURES`.
+
+```bash
+cmake -B build/src -S . -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
+  -DGGML_CUDA_FA_QUANTS=all \
+  -DLLAMA_CURL=OFF
+cmake --build build/src -j "$(nproc)" --target llama-server llama-bench llama-quantize
+```
 
 ### `GGML_CUDA_FA_QUANTS`
 
@@ -102,9 +158,13 @@ llama-server -m <model>.gguf ^
   --spec-type ngram-mod,draft-mtp-adaptive --spec-draft-n-max 4 ^
   --spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 24 ^
   --spec-ngram-mod-n-max 64 --spec-lookup-n-max 64 ^
-  --reasoning-budget 2048 ^
+  --reasoning-budget -1 ^
   --features-file features.ini
 ```
+
+`--features-file` resolves relative to the **working directory**, and `features.ini` in turn
+holds `spec-draft-vocab-map = maps/shortlist_24k_mix.vocab.txt`, also relative. Run the server
+from the package root, or turn both into absolute paths.
 
 Notes:
 
@@ -119,19 +179,19 @@ Notes:
 - **`GGML_CUDA_FA_SHORTQ_MMA=0`** keeps the in-place quantized-KV kernel for short
   verify batches. Setting it to 1 takes the upstream #189 detour, which was
   measured to cost decode speed on this model.
-- The CUDA runtime dlls must sit next to the executable or on `PATH`; the package
-  carries them in `..\build\cuda\`.
+- The CUDA runtime dlls must sit next to the executable or on `PATH`; the packaged
+  runtime carries them in `..\build\cuda\`.
 
 ## Layout
 
 ```
 code\               this source tree
 ..\build\src\       CMake / Ninja output
-..\build\bin\       runtime binaries
+..\build\bin\       runtime binaries (the prebuilt release lands here)
 ..\build\cuda\      CUDA runtime dlls
 ..\build\logs\      build logs
 ..\weights\         gguf models
-..\features.ini     our runtime switches
+..\features.ini     our runtime switches -- maintained in ada-ternary-runtime
 ```
 
 ## License

@@ -1,8 +1,8 @@
-# ada-ternary — llama.cpp fork for Ternary-Bonsai-2-27B (PTQ1_0 + MTP)
+# llama.cpp-qwen38-flash — llama.cpp fork for Qwen3.8-27B-Flash-MTP (PTQ1_0 + MTP)
 
 A fork of [PrismML-Eng/llama.cpp](https://github.com/PrismML-Eng/llama.cpp) (`prism`
 branch), which is itself a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
-Built for the **Ternary-Bonsai-2-27B** ternary-quantised model on an **NVIDIA Ada
+Built for **Qwen3.8-27B-Flash-MTP** — Qwen3.8-27B in ternary PTQ1_0 — on an **NVIDIA Ada
 (sm_89)** GPU, with speculative decoding driven by an **MTP draft head**.
 
 Upstream baseline: `e8fd209c9` (`grammar: allow schema property order (#347)`).
@@ -17,9 +17,9 @@ because they need to be reviewable and patchable — they used to live only insi
 | Where | What |
 |---|---|
 | **this repo** | the engine: PTQ1_0 kernels, MTP draft context, the speed work, the build scripts |
-| **[ada-ternary-runtime](https://github.com/zgsndzq/ada-ternary-runtime)** | what you launch: `llmserver.bat` / `llmserver.sh`, **`features.ini`**, `llmchat\`, `maps\` |
-| [Releases](https://github.com/zgsndzq/ada-ternary/releases) | prebuilt engine binaries (`build\bin` + `build\cuda`) |
-| [Hugging Face](https://huggingface.co/SuperLogic/Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km) | the weights |
+| **[qwen38-27b-flash-mtp](https://github.com/zgsndzq/qwen38-27b-flash-mtp)** | what you launch: `llmserver.bat` / `llmserver.sh`, **`features.ini`**, `llmchat\`, `maps\` |
+| [Releases](https://github.com/zgsndzq/llama.cpp-qwen38-flash/releases) | prebuilt engine binaries (`build\bin` + `build\cuda`) |
+| [Hugging Face](https://huggingface.co/SuperLogic/Qwen3.8-27B-Flash-MTP-GGUF) | the weights |
 
 > ⚠️ **`features.ini` is not in this repository, and it is not compiled into the binary.**
 > `llama-server` has no built-in default path for it — it is picked up at runtime through
@@ -30,20 +30,20 @@ The two repositories are meant to sit nested, which is the layout the build scri
 (`_build_q8.bat` writes to `..\build\`):
 
 ```bat
-git clone https://github.com/zgsndzq/ada-ternary-runtime
-cd ada-ternary-runtime
-git clone https://github.com/zgsndzq/ada-ternary code
+git clone https://github.com/zgsndzq/qwen38-27b-flash-mtp
+cd qwen38-27b-flash-mtp
+git clone https://github.com/zgsndzq/llama.cpp-qwen38-flash code
 ```
 
 ## Where are the weights
 
 **Not here.** The gguf files live on Hugging Face:
 
-### 👉 https://huggingface.co/SuperLogic/Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km
+### 👉 https://huggingface.co/SuperLogic/Qwen3.8-27B-Flash-MTP-GGUF
 
 | File | Size | Needed for |
 |---|---|---|
-| `Swift-Bonsai-2-PTQ1_0-mtp-pro-q4km.gguf` | 5.79 GB | the model itself |
+| `Qwen3.8-27B-Flash-MTP.gguf` | 5.79 GB | the model itself |
 | `mmproj-Qwen3.8-27B-Q8_0.gguf` | 0.59 GB | reading images |
 | `SHA256SUMS` | — | verifying the two above |
 
@@ -191,7 +191,7 @@ code\               this source tree
 ..\build\cuda\      CUDA runtime dlls
 ..\build\logs\      build logs
 ..\weights\         gguf models
-..\features.ini     our runtime switches -- maintained in ada-ternary-runtime
+..\features.ini     our runtime switches -- maintained in qwen38-27b-flash-mtp
 ```
 
 ## License

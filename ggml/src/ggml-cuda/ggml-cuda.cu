@@ -654,9 +654,15 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
+            // GGML_CUDA_POOL_LOG=1: one line per growth step, tagged with the pool instance (one pool per backend
+            // instance per device; each llama_context creates its own backends, so a draft context has its own pool
+            // and its high-water mark is never returned). Diagnostics only; off by default.
+            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+            if (pool_log) {
+                GGML_LOG_INFO("cuda pool[%d] %p: size %llu MiB (+%llu MiB for a %llu MiB request)\n", device, (void *) this,
+                    (unsigned long long) (pool_size/1024/1024), (unsigned long long) (reserve_size/1024/1024),
+                    (unsigned long long) (size/1024/1024));
+            }
         }
 
         GGML_ASSERT(pool_addr != 0);

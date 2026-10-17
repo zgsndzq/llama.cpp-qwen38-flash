@@ -699,6 +699,31 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
 
 // packed = the mask is GGML_TYPE_I32 (32 cells per word, bit set = attend): mask_ptr then points at words and
 // s31 / s33 are word strides; a tile is fully masked when its FATTN_KQ_STRIDE/32 words are all zero.
+// cells per entry of the tile visibility map (one 64-cell block; GGML_CUDA_FA_SPARSE pages are 64 or more cells)
+#define FATTN_TILE_VIS 64
+
+// set by ggml_cuda_flash_attn_ext (fattn.cu) while it launches an attention op with a GGML_CUDA_FA_SPARSE mask
+inline thread_local bool ggml_cuda_fa_sparse_active = false;
+
+// GGML_CUDA_FA_TILE_SKIP=1: per sequence, query tile (ncols1 rows) and FATTN_TILE_VIS cells, whether any mask value is
+// finite (f16 mask). The MMA kernel skips the KV tiles of an all -inf block (block-sparse masks: GGML_CUDA_FA_SPARSE).
+template <int ncols1>
+__launch_bounds__(FATTN_TILE_VIS)
+static __global__ void flash_attn_mask_to_tile_vis(
+        const half * __restrict__ mask, uint8_t * __restrict__ vis, const int n_vis, const int64_t s31, const int64_t s33,
+        const int n_rows) {
+    const int s = blockIdx.x, jt = blockIdx.y, sequence = blockIdx.z;
+    const int64_t c = (int64_t) s*FATTN_TILE_VIS + threadIdx.x;
+    bool any = false;
+    for (int j = 0; j < ncols1 && jt*ncols1 + j < n_rows; ++j) {
+        any = any || !isinf(__half2float(mask[sequence*s33 + (int64_t) (jt*ncols1 + j)*s31 + c]));
+    }
+    any = __syncthreads_or(any);
+    if (threadIdx.x == 0) {
+        vis[((int64_t) sequence*gridDim.y + jt)*n_vis + s] = any;
+    }
+}
+
 template <int ncols1, bool packed = false>
 __launch_bounds__(FATTN_KQ_STRIDE/2, 1)
 static __global__ void flash_attn_mask_to_KV_max(
@@ -1211,7 +1236,14 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    static const bool tile_skip = [] { const char * e = getenv("GGML_CUDA_FA_TILE_SKIP"); return e && atoi(e) != 0; }();
+    // GGML_CUDA_FA_V_SKIP=1: the vec kernel skips the V rows of 32-cell groups whose weights are all below exp(-20)
+    static const bool v_skip = [] { const char * e = getenv("GGML_CUDA_FA_V_SKIP"); return e && atoi(e) != 0; }();
+    bool tile_vis = false;
+    // a GGML_CUDA_FA_SPARSE mask (fattn.cu) always takes the tile map: without it the kernel reads every masked tile,
+    // also the unselected host pages over PCIe
+    const bool want_vis = (tile_skip || ggml_cuda_fa_sparse_active) && !mask_packed && !chunk;
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || want_vis)) {
         const size_t  es  = mask_packed ? sizeof(uint32_t) : sizeof(half2);
         const int64_t s31 = mask->nb[1] / es;
         const int64_t s33 = mask->nb[3] / es;
@@ -1222,8 +1254,16 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        // with GGML_CUDA_FA_TILE_SKIP the tile visibility map follows the KV_max values in the same buffer (flag 4)
+        tile_vis = want_vis;
+        const int n_vis = K->ne[1] / FATTN_TILE_VIS;
+        KV_max.alloc(ne_KV_max + (tile_vis ? (ne_KV_max*n_vis + 3)/4 : 0));
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        if (tile_vis) {
+            flash_attn_mask_to_tile_vis<ncols1><<<dim3(n_vis, ntiles_x, Q->ne[3]), FATTN_TILE_VIS, 0, main_stream>>>(
+                (const half *) mask->data, (uint8_t *) (KV_max.ptr + ne_KV_max), n_vis, mask->nb[1]/sizeof(half),
+                mask->nb[3]/sizeof(half), (int) Q->ne[1]);
+        }
         if (mask_packed) {
             ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1, true>, launch_params,
                 (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
@@ -1361,7 +1401,7 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        (mask_packed ? 1 : 0) | (chunk ? 2 : 0)   // 2: chunk launch (fattn-mma-f16.cuh)
+        (mask_packed ? 1 : 0) | (chunk ? 2 : 0) | (tile_vis ? 4 : 0) | (v_skip ? 8 : 0)   // 2: chunk launch, 4: tile visibility map (fattn-mma-f16.cuh), 8: V skip (fattn-vec.cuh)
     );
     CUDA_CHECK(cudaGetLastError());
 

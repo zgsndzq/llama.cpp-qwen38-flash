@@ -941,8 +941,16 @@ struct ggml_backend_cuda_buffer_context {
     }
 };
 
+// GGML_CUDA_FA_SPARSE (fattn.cu): the attention ops the fast path takes (they stage their kept pages themselves)
+bool ggml_cuda_fa_sparse_eligible(const ggml_tensor * fa);
+// GGML_CUDA_FA_SPARSE_FAST (fattn.cu): writes into a K cache tensor invalidate its cached page bounds
+void ggml_cuda_fa_sparse_note_bytes(const void * p, size_t n);
+void ggml_cuda_fa_sparse_note_op(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+void ggml_cuda_fa_sparse_note_input(const ggml_tensor * t, const void * data, size_t offset, size_t size);
+
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
+    ggml_cuda_fa_sparse_note_bytes(ctx->dev_ptr, buffer->size);
     delete ctx;
 }
 
@@ -979,6 +987,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_fa_sparse_note_bytes((char *) tensor->data + offset, size);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -987,6 +996,8 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_fa_sparse_note_input(tensor, data, offset, size);
+    ggml_cuda_fa_sparse_note_bytes((char *) tensor->data + offset, size);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1004,6 +1015,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    ggml_cuda_fa_sparse_note_bytes((char *) tensor->data + offset, n_copies*stride_tensor);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -1021,6 +1033,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_cuda_fa_sparse_note_bytes(dst->data, ggml_nbytes(dst));
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -1048,6 +1061,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    ggml_cuda_fa_sparse_note_bytes(ctx->dev_ptr, buffer->size);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1342,6 +1356,63 @@ void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream
     return any ? (void *) (e->va2 + lo) : nullptr;
 }
 
+static const ggml_cuda_tier_entry * ggml_cuda_tier_find(const void * ptr);
+static bool ggml_cuda_tier_host_part(const ggml_cuda_tier_entry * e, size_t lo, size_t hi, size_t * a, size_t * b);
+
+// copy only the host pages with keep[p] != 0 (page p: cells first_cell + p*page ...) of [ptr, ptr + nbytes) into the
+// staging alias, from inside a kernel (no host sync: keep is on the device). Pages of the VRAM part and unkept pages
+// are not touched. Returns the alias of ptr, nullptr when ptr is not in a tiered buffer with staging.
+static __global__ void k_tier_stage_pages(const char * __restrict__ src, char * __restrict__ dst, const uint8_t * __restrict__ keep,
+        const size_t row_bytes, const int64_t first_cell, const int page, const size_t lo, const size_t hi, const int vec) {
+    const int p = blockIdx.x;
+    if (!keep[p]) {
+        return;
+    }
+    const size_t c0 = (size_t) (first_cell + (int64_t) p*page)*row_bytes, c1 = c0 + (size_t) page*row_bytes;
+    const size_t a = c0 > lo ? c0 : lo, b = c1 < hi ? c1 : hi;
+    if (vec == 16) {
+        for (size_t o = a + (size_t) threadIdx.x*16; o + 16 <= b; o += (size_t) blockDim.x*16) {
+            *(uint4 *) (dst + o) = *(const uint4 *) (src + o);
+        }
+    } else {
+        for (size_t o = a + threadIdx.x; o < b; o += blockDim.x) {
+            dst[o] = src[o];
+        }
+    }
+}
+
+void * ggml_cuda_tier_stage_pages(const void * ptr, size_t nbytes, size_t row_bytes, int64_t first_cell, int page, int n_pages,
+        const uint8_t * keep, cudaStream_t stream) {
+    const ggml_cuda_tier_entry * e = ggml_cuda_tier_find(ptr);
+    if (!e || n_pages <= 0) {
+        return nullptr;
+    }
+    const size_t lo = (CUdeviceptr) ptr - e->va, hi = std::min(e->total, lo + nbytes);
+    size_t a, b;
+    if (!ggml_cuda_tier_host_part(e, lo, hi, &a, &b)) {
+        return nullptr;
+    }
+    // offsets relative to ptr; the kernel copies [lo', hi') of each kept page, lo' = the host part of ptr
+    const char * src = (const char *) ptr;
+    char       * dst = (char *) (e->va2 + lo);
+    const int vec = ((a - lo) | row_bytes | (size_t) src | (size_t) dst) % 16 == 0 ? 16 : 1;
+    k_tier_stage_pages<<<n_pages, 256, 0, stream>>>(src, dst, keep, row_bytes, first_cell, page, a - lo, b - lo, vec);
+    CUDA_CHECK(cudaGetLastError());
+    return dst;
+}
+
+// the cache address of an address in a staging alias (a set_rows redirected there writes these cells), else p
+const void * ggml_cuda_tier_unalias(const void * p) {
+    const CUdeviceptr q = (CUdeviceptr) p;
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    for (auto & it : g_tier_entries) {
+        if (it.va2 && q >= it.va2 && q < it.va2 + it.total) {
+            return (const void *) (it.va + (q - it.va2));
+        }
+    }
+    return p;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * bctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
     const int device   = bctx->device;
@@ -1488,6 +1559,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
                 host_runs.clear();
                 GGML_LOG_WARN("%s: no staging alias for %s: its host tail is read over PCIe in place\n", __func__, bctx->name.c_str());
             } else {
+                // staging is shared and read where masked out (GGML_CUDA_FA_SPARSE stages kept pages only): never
+                // leave bytes there that decode to NaN or Inf
+                for (auto & hr : host_runs) {
+                    cuMemsetD8(va2 + hr.first, 0, hr.second);
+                }
                 ggml_cuda_tier_register(va, va2, total, host_runs);
             }
         }
@@ -1517,6 +1593,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream) {
     GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
     return nullptr;
+}
+void * ggml_cuda_tier_stage_pages(const void * ptr, size_t nbytes, size_t row_bytes, int64_t first_cell, int page, int n_pages,
+        const uint8_t * keep, cudaStream_t stream) {
+    GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(row_bytes); GGML_UNUSED(first_cell); GGML_UNUSED(page);
+    GGML_UNUSED(n_pages); GGML_UNUSED(keep); GGML_UNUSED(stream);
+    return nullptr;
+}
+const void * ggml_cuda_tier_unalias(const void * p) {
+    return p;
 }
 
 bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream) {
@@ -1566,6 +1651,20 @@ static bool ggml_cuda_tier_host_part(const ggml_cuda_tier_entry * e, size_t lo, 
         }
     }
     return false;
+}
+
+// first cell (row nb[1]) of t that lives in a host run of its tiered buffer, -1 when none (GGML_CUDA_FA_SPARSE)
+int64_t ggml_cuda_tier_first_host_cell(const ggml_tensor * t) {
+    const ggml_cuda_tier_entry * e = ggml_cuda_tier_find(t->data);
+    if (!e) {
+        return -1;
+    }
+    const size_t lo = (CUdeviceptr) t->data - e->va;
+    size_t a, b;
+    if (!ggml_cuda_tier_host_part(e, lo, std::min(e->total, lo + ggml_nbytes(t)), &a, &b)) {
+        return -1;
+    }
+    return (int64_t) ((a - lo) / t->nb[1]);
 }
 
 static bool ggml_cuda_tier_reaches_host(const ggml_tensor * t) {
@@ -1715,7 +1814,7 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
         // ops that take the chunked path (GGML_CUDA_FA_CHUNK) copy their own K/V chunks, never read staging and
         // never call ggml_cuda_tier_fa_begin, so they stay out of the pipeline
         if (prefetch_on && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
-                !ggml_cuda_flash_attn_ext_chunked(n) &&
+                !ggml_cuda_flash_attn_ext_chunked(n) && !ggml_cuda_fa_sparse_eligible(n) &&
                 (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
             ts.fa.push_back(n);
         }
@@ -1825,6 +1924,10 @@ bool ggml_cuda_tier_fa_begin(ggml_backend_cuda_context & ctx, const ggml_tensor 
 }
 void ggml_cuda_tier_fa_end(ggml_backend_cuda_context & ctx) {
     GGML_UNUSED(ctx);
+}
+int64_t ggml_cuda_tier_first_host_cell(const ggml_tensor * t) {
+    GGML_UNUSED(t);
+    return -1;
 }
 #endif
 
@@ -3316,6 +3419,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
         CUDA_CHECK(err);
     }
+    ggml_cuda_fa_sparse_note_op(ctx, dst);
 
     return true;
 }
@@ -3343,6 +3447,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(ggml_backend_buft_is_cuda(buf->buft) && ((ggml_backend_cuda_buffer_type_context *) buf->buft->context)->device == cuda_ctx->device && "unsupported buffer type");
 
+    ggml_cuda_fa_sparse_note_input(tensor, data, offset, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -5865,9 +5970,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (++n_graphs % 100 == 0) {
                     std::vector<std::pair<std::string, acc>> v(totals.begin(), totals.end());
                     std::sort(v.begin(), v.end(), [](auto & x, auto & y) { return x.second.ms > y.second.ms; });
-                    GGML_LOG_INFO("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
+                    GGML_LOG_WARN("op timing over %lld graphs: %.3f ms per graph\n", (long long) n_graphs, ms_graphs / n_graphs);
                     for (size_t k = 0; k < v.size() && k < 30; ++k) {
-                        GGML_LOG_INFO("  %8.3f ms/graph %6.1f%%  x%-5lld %s\n", v[k].second.ms / n_graphs,
+                        GGML_LOG_WARN("  %8.3f ms/graph %6.1f%%  x%-5lld %s\n", v[k].second.ms / n_graphs,
                             100.0 * v[k].second.ms / ms_graphs, (long long) (v[k].second.n / n_graphs), v[k].first.c_str());
                     }
                     totals.clear();

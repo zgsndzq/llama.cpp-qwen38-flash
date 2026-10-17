@@ -713,7 +713,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         float        * const __restrict__ KQ_rowsum,
         const int jt,
         const int kb0,
-        const int k_VKQ_sup) {
+        const int k_VKQ_sup,
+        const int kb0_next = -1) {   // the tile the multi-stage pipeline preloads next (-1: kb0 + 1)
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     constexpr int  warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int  ncols           = ncols1 * ncols2;
@@ -1108,10 +1109,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (!last_iter) {
             if (ncols2 > 1 || mask_h) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                    (flash_attn_ext_f16_mask_at(mask_h, stride_mask, k_VKQ_0 + nbatch_fa), tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+                    (flash_attn_ext_f16_mask_at(mask_h, stride_mask, kb0_next >= 0 ? kb0_next*nbatch_fa : k_VKQ_0 + nbatch_fa), tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (K_h2 + int64_t(k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
+                (K_h2 + int64_t(kb0_next >= 0 ? kb0_next*nbatch_fa : k_VKQ_0 + nbatch_fa)*stride_K, tile_K, nbatch_K2, stride_K, k_VKQ_sup);
         }
     }
 
@@ -1309,7 +1310,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int jt,
         const int zt_gqa,
         const int kb0_start,
-        const int kb0_stop) {
+        const int kb0_stop,
+        const uint8_t * tile_vis = nullptr) {   // per FATTN_TILE_VIS cells of this query tile: 0 = all masked, skip
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
     //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
 
@@ -1425,7 +1427,23 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     __syncthreads();
 
-    int kb0 = kb0_start;
+    // GGML_CUDA_FA_TILE_SKIP: the next KV tile with a visible cell for this query tile (the last tile always runs)
+    auto next_vis = [&](int k) {
+        if (tile_vis) {
+            while (k < kb0_stop - 1) {
+                bool vis = false;
+                for (int c = (k*nbatch_fa)/FATTN_TILE_VIS; c*FATTN_TILE_VIS < (k + 1)*nbatch_fa; ++c) {
+                    vis = vis || tile_vis[c];
+                }
+                if (vis) {
+                    break;
+                }
+                ++k;
+            }
+        }
+        return k;
+    };
+    int kb0 = next_vis(kb0_start);
 
     // Preload mask and K data for first iteration when using cp_async with multiple stages:
     if constexpr (nstages > 1) {
@@ -1444,7 +1462,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
     if constexpr (ncols2 == 1) {
         constexpr bool oob_check = true;
-        for (; kb0 < kb0_stop-1; ++kb0) {
+        for (; kb0 < kb0_stop-1; ) {
+            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1452,7 +1471,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kb0_next);
+            kb0 = kb0_next;
         }
         constexpr bool last_iter = true;
         const     int  k_VKQ_sup = ne11 - kb0*nbatch_fa;
@@ -1464,7 +1484,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
     } else {
         constexpr bool oob_check = false;
-        for (; kb0 < kb0_stop-1; ++kb0) {
+        for (; kb0 < kb0_stop-1; ) {
+            const int kb0_next = next_vis(kb0 + 1);   // fully masked tiles are skipped, also by the preload
             constexpr bool last_iter = false;
             constexpr int  k_VKQ_sup = nbatch_fa;
             flash_attn_ext_f16_iter
@@ -1472,7 +1493,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, Q_B, VKQ_C,
-                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup);
+                 KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, kb0_next);
+            kb0 = kb0_next;
         }
         constexpr bool last_iter = true;
         constexpr int  k_VKQ_sup = nbatch_fa;
@@ -1964,6 +1986,8 @@ static __global__ void flash_attn_ext_f16(
     // mask_packed & 2: chunk launch (GGML_CUDA_FA_CHUNK, launch_fattn). Every block has one whole tile and takes the
     // needs_fixup path: unnormalized output to dst, (max, rowsum) to dst_meta, for the chunk fold kernel.
     const bool chunk_part = (mask_packed & 2) != 0;
+    // mask_packed & 4: GGML_CUDA_FA_TILE_SKIP map after the KV_max values (launch_fattn), [sequence][jt][ne11/FATTN_TILE_VIS]
+    const uint8_t * tile_vis_all = (mask_packed & 4) && KV_max ? (const uint8_t *) (KV_max + (ne01.z + ncols1 - 1)/ncols1*ne03) : nullptr;
 
     const int stride_V = V_is_K_view ? stride_K : (type_KV == GGML_TYPE_F16 ? nb21 / sizeof(half2) : nb21);
 
@@ -2011,12 +2035,14 @@ static __global__ void flash_attn_ext_f16(
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile, or a chunk launch.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr);
         }
 
         kbc += iter_k;
@@ -2057,7 +2083,8 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop,
+                 tile_vis_all ? tile_vis_all + ((int64_t) sequence*iter_j + jt)*(ne11/FATTN_TILE_VIS) : nullptr);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,

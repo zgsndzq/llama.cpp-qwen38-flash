@@ -41,7 +41,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33,
         const int32_t mask_packed) {
-    GGML_UNUSED(mask_packed);   // packed masks are expanded to f16 before this kernel (fattn.cu)
+    // packed masks are expanded to f16 before this kernel (fattn.cu); bit 8: GGML_CUDA_FA_V_SKIP (launch_fattn)
+    const bool v_skip = (mask_packed & 8) != 0;
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
@@ -257,6 +258,29 @@ static __global__ void flash_attn_ext_vec(
              // Increment pointers after each loop:
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
+        // A tile whose mask is -inf for every cell and every column adds exp(-inf) = 0 to the sums and does not move
+        // the maximum, so it can be skipped without reading its K/V rows; with GGML_CUDA_FA_SPARSE this is what
+        // keeps unselected host-tail pages off the PCIe link. Exact: the result is the same as processing the tile.
+        if (mask) {
+            const int i_tile = threadIdx.y*WARP_SIZE + threadIdx.x;
+            bool visible = false;
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                    visible = visible || !isinf(__half2float(maskh[j*ne11 + i_tile]));
+                }
+            }
+            if (!__syncthreads_or(visible)) {
+                continue;
+            }
+            // each warp owns 32 cells of the tile for both KQ and V (warp-level sync only below), so a warp whose
+            // cells are all masked skips them too: with 64-cell sparse pages a kept page no longer pulls in its
+            // neighbour's rows. Exact, like the tile skip.
+            if (!__any_sync(0xFFFFFFFF, visible)) {
+                continue;
+            }
+        }
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
@@ -323,8 +347,21 @@ static __global__ void flash_attn_ext_vec(
         __syncwarp();
 #endif // GGML_USE_HIP
 
+        // GGML_CUDA_FA_V_SKIP: this warp's 32 cells skip their V rows when every weight, relative to the running
+        // maximum, is below exp(-20). The maximum only grows, so the final weights are smaller still; the skipped
+        // mass is at most n_cells * 2e-9 of the largest weight (about 4e-4 at 192k cells).
+        bool v_warp = true;
+        if (v_skip) {
+            bool big = false;
 #pragma unroll
-        for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
+            for (int j = 0; j < ncols; ++j) {
+                big = big || KQ_reg[j] > 2.0611536e-9f;
+            }
+            v_warp = __any_sync(0xFFFFFFFF, big);
+        }
+
+#pragma unroll
+        for (int k0 = 0; k0 < WARP_SIZE && v_warp; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 
 #ifdef V_DOT2_F32_F16_AVAILABLE

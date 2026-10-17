@@ -1399,6 +1399,38 @@ static bool ggml_cuda_tier_reaches_host(const ggml_tensor * t) {
     return ggml_cuda_tier_host_part(e, lo, std::min(e->total, lo + ggml_nbytes(t)), &a, &b);
 }
 
+// A graph whose attention reads the host tail of a tiered KV cache runs without a CUDA graph: the prefetch pipeline
+// (ggml_cuda_tier_graph_begin: the copy engine stages the next attention op's host rows while this one computes) runs
+// only on that path, and it beats the CUDA graph at depth (RTX 4070, 262k window, 192k deep, lookup off: decode
+// 19.8 -> 25.0 tok/s). Graphs below the tier line keep their CUDA graphs. GGML_CUDA_KV_TIER_GRAPHS=1: old behaviour.
+static bool ggml_cuda_tier_graph_wants_pipeline(const ggml_cgraph * cgraph) {
+    static const bool keep_graphs = [] {
+        const char * v = getenv("GGML_CUDA_KV_TIER_GRAPHS");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    static const bool prefetch_on = [] {
+        const char * v = getenv("GGML_CUDA_KV_TIER_PREFETCH");
+        return v == nullptr || atoi(v) != 0;
+    }();
+    if (keep_graphs || !prefetch_on) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        if (g_tier_entries.empty()) {
+            return false;
+        }
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
+                (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // one block per index: copy row idx[r] from the alias (VRAM staging) to the original range (host pages) when the
 // row touches the host run [h_lo, h_hi) (offsets from the tensor base); rows in VRAM are the same pages in both
 template <typename idx_t>
@@ -1592,6 +1624,10 @@ void ggml_cuda_tier_fa_end(ggml_backend_cuda_context & ctx) {
     }
 }
 #else
+static bool ggml_cuda_tier_graph_wants_pipeline(const ggml_cgraph * cgraph) {
+    GGML_UNUSED(cgraph);
+    return false;
+}
 static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cuda_tier_state & ts, const ggml_cgraph * cgraph, bool enable) {
     GGML_UNUSED(ctx); GGML_UNUSED(ts); GGML_UNUSED(cgraph); GGML_UNUSED(enable);
 }
@@ -3233,6 +3269,20 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    {
+        // the tier prefetch pipeline instead (see ggml_cuda_tier_graph_wants_pipeline); one log line per switch
+        static int last = -1;
+        const bool pipe = ggml_cuda_tier_graph_wants_pipeline(cgraph);
+        if ((int) pipe != last) {
+            last = (int) pipe;
+            GGML_LOG_WARN("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s\n", __func__,
+                pipe ? "reads" : "does not read", pipe ? "off, tier prefetch pipeline on" : "on");
+        }
+        if (pipe) {
+            return false;
+        }
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph

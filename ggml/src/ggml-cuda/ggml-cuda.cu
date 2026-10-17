@@ -1204,13 +1204,21 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 
     // page p is VRAM when its start lies in the head of its part
     const size_t n_pages = total / gran;
+    // GGML_CUDA_KV_TIER_STAGING_FRAC=f: only the first f x part bytes of each host tail get a staging buffer (see the
+    // staging alias below); the rest of the tail is its own allocation, mapped in place in the alias. Unset: whole tail.
+    static const double stage_frac = [] {
+        const char * e = getenv("GGML_CUDA_KV_TIER_STAGING_FRAC");
+        return e ? std::max(0.0, atof(e)) : 2.0;
+    }();
     std::vector<bool> in_vram(n_pages);
+    std::vector<bool> staged(n_pages);
     size_t n_vram = 0;
     for (size_t p = 0; p < n_pages; ++p) {
         const size_t off  = p * gran;
         const size_t ip   = std::min<size_t>(off / std::max<size_t>(part, 1), parts - 1);
         const size_t head = (size_t) (bctx->vram_frac * part);
         in_vram[p] = off - ip*part < head;
+        staged[p]  = !in_vram[p] && (double) (off - ip*part - head) < stage_frac * (double) part;
         n_vram += in_vram[p];
     }
 
@@ -1221,7 +1229,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
         return nullptr;
     }
 
-    struct run { CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; };
+    struct run { CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; bool staged; };
     std::vector<run> runs;
     auto undo = [runs_p = &runs, va, total]() {
         for (auto & rr : *runs_p) {
@@ -1233,7 +1241,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 
     for (size_t p = 0; p < n_pages; ) {
         size_t q = p;
-        while (q < n_pages && in_vram[q] == in_vram[p]) {
+        while (q < n_pages && in_vram[q] == in_vram[p] && staged[q] == staged[p]) {
             ++q;
         }
         const size_t len = (q - p) * gran;
@@ -1252,7 +1260,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
             undo();
             return nullptr;
         }
-        runs.push_back({ va + p*gran, len, h });
+        runs.push_back({ va + p*gran, len, h, (bool) staged[p] });
         p = q;
     }
 
@@ -1282,7 +1290,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
             for (auto & rr : runs) {
                 const size_t off = rr.ptr - va;
                 CUmemGenericAllocationHandle h = rr.h;
-                if (!in_vram[off / gran]) {
+                if (rr.staged) {
                     CUmemGenericAllocationHandle bh;
                     if (!ggml_cuda_tier_staging_handle(physical, ggml_cuda_tier_staging_key(bctx->name), ih++, rr.len, &bh)) {
                         ok = false;

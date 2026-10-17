@@ -666,6 +666,16 @@ static __global__ void expand_kq_mask_bits(const uint32_t * __restrict__ bits, h
     }
 }
 
+// GGML_CUDA_KV_TIER_STAGE_MIN_Q=q: attention ops with fewer than q queries (decode, small verify batches) that are not
+// in the prefill prefetch read the host tail in place and copy nothing. Unset: 0 (every op that reaches the tail stages).
+static int64_t ggml_cuda_tier_stage_min_q() {
+    static const int64_t q = [] {
+        const char * e = getenv("GGML_CUDA_KV_TIER_STAGE_MIN_Q");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    return q;
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     ggml_tensor * mask_in = dst->src[3];
@@ -715,7 +725,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             if (V_alias) {
                 V->data = V_alias;
             }
-        } else {
+        } else if (dst->src[0]->ne[1] >= ggml_cuda_tier_stage_min_q()) {
             if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
                 K->data = a;
             }

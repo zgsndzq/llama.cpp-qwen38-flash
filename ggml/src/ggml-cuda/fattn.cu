@@ -31,7 +31,9 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
         return e ? atoi(e) : 0;
     }();
     if (shortq_mma != 0 && turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        // upstream #355: keep type_KV here too, otherwise the F16 instantiation converts K/V into scratch that
+        // ggml_cuda_flash_attn_ext_get_alloc_size does not reserve on the in-place quantized path.
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV>(ctx, dst);
         return;
     }
 

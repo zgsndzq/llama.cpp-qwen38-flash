@@ -1054,6 +1054,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_sum_rows_f32;
     vk_pipeline pipeline_fwht_f32[GGML_VK_FWHT_NUM_SIZES];
     vk_pipeline pipeline_fwht_f16[GGML_VK_FWHT_NUM_SIZES];
+    vk_pipeline pipeline_fwht_signed_f32[GGML_VK_FWHT_NUM_SIZES];
     // rows a workgroup covers, chosen per width when the pipeline is built
     uint32_t fwht_rows_per_wg[GGML_VK_FWHT_NUM_SIZES] = {};
     vk_pipeline pipeline_cumsum_f32;
@@ -1413,6 +1414,15 @@ struct vk_op_push_constants {
 struct vk_op_fwht_push_constants {
     uint32_t n_rows;
     uint32_t src_offset;
+    uint32_t dst_offset;
+    float scale;
+};
+
+struct vk_op_fwht_signed_push_constants {
+    uint32_t n_rows;
+    uint32_t src_offset;
+    uint32_t signs_offset;
+    uint32_t signs_ne;
     uint32_t dst_offset;
     float scale;
 };
@@ -2405,6 +2415,8 @@ struct ggml_backend_vk_context {
     int fused_ops_write_mask {};
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
+    // set when the current node leads a MUL -> RESHAPE -> MUL_MAT(hadamard) fusion
+    bool fused_fwht_signed {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -5823,6 +5835,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     if (device->fp16) {
                         ggml_vk_create_pipeline(device, device->pipeline_fwht_f16[idx], "fwht_f16", fwht_f16_len, fwht_f16_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     }
+                    // folds a preceding elementwise sign multiply into the transform load
+                    ggml_vk_create_pipeline(device, device->pipeline_fwht_signed_f32[idx], "fwht_signed_f32", fwht_signed_f32_len, fwht_signed_f32_data, "main", 3, sizeof(vk_op_fwht_signed_push_constants), {1, 1, 1}, { device->subgroup_size, n, GGML_VK_FWHT_ROWS }, 1, true, true, device->subgroup_size);
                     device->fwht_rows_per_wg[idx] = GGML_VK_FWHT_ROWS;
                 }
             } else {
@@ -10107,6 +10121,74 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     init_pushconst_tensor_offsets(ctx, pc, src, nullptr, nullptr, nullptr, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
+}
+
+// MUL(signs) -> RESHAPE -> MUL_MAT(hadamard): apply the sign vector while the transform loads
+// its row, so the separate elementwise pass over the activation is skipped.
+static bool ggml_vk_can_fuse_fwht_signed(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { node_idx + 2 })) {
+        return false;
+    }
+    if (!ggml_check_edges(cgraph, node_idx, { { 1, 0, 0 }, { 2, 1, 1 } })) {
+        return false;
+    }
+
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * mm  = cgraph->nodes[node_idx + 2];
+
+    if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+
+    const int64_t n = mm->src[0]->ne[0];
+    const int idx = ggml_vk_fwht_pipeline_idx(n);
+    if (idx < 0 || ctx->device->pipeline_fwht_signed_f32[idx] == nullptr) {
+        return false;
+    }
+
+    return signs->type == GGML_TYPE_F32 && signs->ne[1] == 1 && signs->ne[2] == 1 && signs->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(signs) && ggml_is_contiguous(mm) &&
+        ggml_are_same_shape(mm->src[1], mm) &&
+        signs->ne[0] == x->ne[0] && n > 0 && x->ne[0] % n == 0;
+}
+
+static void ggml_vk_fwht_signed(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mul = cgraph->nodes[node_idx];
+    const ggml_tensor * mm  = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * x     = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * signs = (x == mul->src[0]) ? mul->src[1] : mul->src[0];
+
+    const int64_t n = mm->src[0]->ne[0];
+    const int idx = ggml_vk_fwht_pipeline_idx(n);
+    vk_pipeline pipeline = ctx->device->pipeline_fwht_signed_f32[idx];
+
+    const uint32_t rows_per_workgroup = ctx->device->fwht_rows_per_wg[idx];
+    GGML_ASSERT(rows_per_workgroup > 0);
+    const uint32_t n_rows = (uint32_t)(ggml_nelements(x) / n);
+    const uint32_t max_workgroups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint32_t workgroups_x = std::min(CEIL_DIV(n_rows, rows_per_workgroup), max_workgroups_x);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer x_buf = ggml_vk_tensor_subbuffer(ctx, x, true);
+    const vk_subbuffer s_buf = ggml_vk_tensor_subbuffer(ctx, signs, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, mm, true);
+
+    vk_op_fwht_signed_push_constants pc = {
+        n_rows,
+        (uint32_t)(get_misalign_bytes(ctx, x)     / ggml_type_size(x->type)),
+        (uint32_t)(get_misalign_bytes(ctx, signs) / ggml_type_size(signs->type)),
+        (uint32_t)signs->ne[0],
+        (uint32_t)(get_misalign_bytes(ctx, mm)    / ggml_type_size(mm->type)),
+        1.0f / std::sqrt((float)n),
+    };
+
+    // descriptor bindings must follow the shader: 0 = x, 1 = dst, 2 = signs
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, d_buf, s_buf }, pc, { workgroups_x, 1, 1 });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -15571,7 +15653,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_MUL:
-        if (ctx->num_additional_fused_ops) {
+        if (ctx->fused_fwht_signed) {
+            ggml_vk_fwht_signed(ctx, compute_ctx, cgraph, node_idx);
+        } else if (ctx->num_additional_fused_ops) {
             ggml_vk_snake_dispatch_fused(ctx, compute_ctx, cgraph, node_idx);
         } else {
             ggml_vk_mul(ctx, compute_ctx, src0, src1, node);
@@ -17326,6 +17410,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
+        ctx->fused_fwht_signed = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -17333,6 +17418,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (ggml_vk_can_fuse_fwht_signed(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_fwht_signed = true;
+                fusion_string = "MUL_RESHAPE_MUL_MAT";
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = false;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";
@@ -17531,6 +17623,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_ops_write_mask = 1;
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
+                ctx->fused_fwht_signed        = false;
             }
         }
 

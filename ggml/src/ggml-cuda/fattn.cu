@@ -676,8 +676,190 @@ static int64_t ggml_cuda_tier_stage_min_q() {
     return q;
 }
 
+// ggml-cuda.cu: copy a range of a tiered buffer that reaches its host part into VRAM (dst == nullptr: only ask)
+bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream);
+
+// GGML_CUDA_FA_CHUNK=C: prefill-sized attention ops (at least GGML_CUDA_FA_PREFILL_F16_MIN_Q queries) over a quantized
+// K/V cache longer than C cells run the KV dimension in chunks of C cells (rounded down to a multiple of 256). Per
+// chunk: the chunk's K/V bytes are copied into VRAM when they reach the host part of a tiered buffer (copy engine,
+// each host row read once), converted to f16 in pool memory sized by C, and the f16 tensor-core kernel runs on them
+// with the matching mask columns. Its unnormalized output and (max, rowsum) per row are folded into a running result
+// (launch_fattn, flash_attn_chunk_fold). Memory is bounded by C, not by the KV length, so the f16 prefill path works
+// at any depth. Unset or 0: off, nothing changes. Anything this path does not handle takes the normal path.
+static int64_t ggml_cuda_fattn_chunk_cells() {
+    static const int64_t c = [] {
+        const char * e = getenv("GGML_CUDA_FA_CHUNK");
+        const int64_t v = e ? (int64_t) atoll(e) : 0;
+        return v > 0 ? std::max<int64_t>(FATTN_KQ_STRIDE, v - v % FATTN_KQ_STRIDE) : (int64_t) 0;
+    }();
+    return c;
+}
+
+bool ggml_cuda_flash_attn_ext_chunked(const ggml_tensor * dst) {
+    const int64_t C = ggml_cuda_fattn_chunk_cells();
+    if (C == 0) {
+        return false;
+    }
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+    if (!Q || !K || !V || K == V || sinks) {
+        return false;
+    }
+    if (V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs))) {
+        return false;
+    }
+    if (Q->ne[1] < ggml_cuda_fattn_prefill_min_q() || K->ne[1] <= C || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || K->type != V->type || !ggml_is_quantized(K->type) ||
+            ggml_get_to_fp16_nc_cuda(K->type) == nullptr) {
+        return false;
+    }
+    if (K->nb[0] != ggml_type_size(K->type) || V->nb[0] != ggml_type_size(V->type)) {
+        return false;
+    }
+    // head sizes of the plain f16 tensor-core kernel (ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2)
+    switch (K->ne[0]) {
+        case 64: case 80: case 96: case 112: case 128: case 256:
+            break;
+        default:
+            return false;
+    }
+    if (V->ne[0] != K->ne[0]) {
+        return false;
+    }
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    // one sequence: a chunk of cells is then one contiguous byte range of K and of V
+    if (Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 || (mask && (mask->ne[2] != 1 || mask->ne[3] != 1))) {
+        return false;
+    }
+    if (mask && mask->type != GGML_TYPE_F16 && mask->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+        return false;
+    }
+    return ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst) == BEST_FATTN_KERNEL_MMA_F16;
+}
+
+static void ggml_cuda_flash_attn_ext_chunks(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    ggml_cuda_pool & pool   = ctx.pool();
+    cudaStream_t     stream = ctx.stream();
+
+    const int64_t C        = ggml_cuda_fattn_chunk_cells();
+    const int64_t n_kv     = K->ne[1];
+    const int64_t n_chunks = (n_kv + C - 1) / C;
+
+    static bool logged = false;
+    if (!logged) {
+        GGML_LOG_INFO("%s: GGML_CUDA_FA_CHUNK: chunks of %lld cells (first op: %lld cells, %lld chunks, %lld queries)\n",
+            __func__, (long long) C, (long long) n_kv, (long long) n_chunks, (long long) dst->src[0]->ne[1]);
+        logged = true;
+    }
+
+    // running (max, rowsum) per output row and Q head; the running output is dst itself
+    ggml_cuda_pool_alloc<float2> meta(pool, ggml_nrows(dst));
+    // unnormalized output of one chunk
+    ggml_cuda_pool_alloc<float>  part(pool, ggml_nelements(dst));
+
+    const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+    const size_t ts = ggml_type_size(K->type);
+
+    for (int64_t ic = 0; ic < n_chunks; ++ic) {
+        const int64_t kv0 = ic*C;
+        const int64_t n   = std::min(C, n_kv - kv0);
+
+        // quantized chunk views of K and V (cells [kv0, kv0 + n))
+        ggml_tensor Kc = *K;
+        ggml_tensor Vc = *V;
+        Kc.ne[1] = n;
+        Vc.ne[1] = n;
+        Kc.data  = (char *) K->data + kv0*K->nb[1];
+        Vc.data  = (char *) V->data + kv0*V->nb[1];
+
+        // host-backed rows of a tiered cache: one DMA copy per chunk into VRAM; the kernels never read host pages
+        ggml_cuda_pool_alloc<char> K_q(pool);
+        ggml_cuda_pool_alloc<char> V_q(pool);
+        const char * K_src = (const char *) Kc.data;
+        const char * V_src = (const char *) Vc.data;
+        const size_t K_span = ggml_nbytes(&Kc);
+        const size_t V_span = ggml_nbytes(&Vc);
+        if (ggml_cuda_tier_copy_out(nullptr, K_src, K_span, stream)) {
+            ggml_cuda_tier_copy_out(K_q.alloc(K_span), K_src, K_span, stream);
+            K_src = K_q.get();
+        }
+        if (ggml_cuda_tier_copy_out(nullptr, V_src, V_span, stream)) {
+            ggml_cuda_tier_copy_out(V_q.alloc(V_span), V_src, V_span, stream);
+            V_src = V_q.get();
+        }
+
+        // f16 copies of the chunk, contiguous [D, n, n_head_kv]
+        ggml_cuda_pool_alloc<half> K_f16(pool, K->ne[0]*n*K->ne[2]);
+        ggml_cuda_pool_alloc<half> V_f16(pool, V->ne[0]*n*V->ne[2]);
+        to_fp16(K_src, K_f16.get(), K->ne[0], n, K->ne[2], 1, K->nb[1]/ts, K->nb[2]/ts, K->nb[3]/ts, stream);
+        to_fp16(V_src, V_f16.get(), V->ne[0], n, V->ne[2], 1, V->nb[1]/ts, V->nb[2]/ts, V->nb[3]/ts, stream);
+
+        ggml_tensor K_h = Kc;
+        ggml_tensor V_h = Vc;
+        for (ggml_tensor * t : {&K_h, &V_h}) {
+            t->type      = GGML_TYPE_F16;
+            t->nb[0]     = sizeof(half);
+            t->nb[1]     = t->ne[0]*t->nb[0];
+            t->nb[2]     = t->ne[1]*t->nb[1];
+            t->nb[3]     = t->ne[2]*t->nb[2];
+            t->view_src  = nullptr;
+            t->view_offs = 0;
+        }
+        K_h.data = K_f16.get();
+        V_h.data = V_f16.get();
+
+        // mask columns of the chunk (packed: 32 cells per word; kv0 is a multiple of 256)
+        ggml_tensor mask_c;
+        if (mask) {
+            const bool packed = mask->type == GGML_TYPE_I32;
+            mask_c = *mask;
+            mask_c.ne[0]    = packed ? n/32 : n;
+            mask_c.data     = (char *) mask->data + (packed ? (kv0/32)*sizeof(uint32_t) : kv0*sizeof(half));
+            mask_c.view_src = nullptr;
+        }
+
+        ggml_tensor dst_c = *dst;
+        dst_c.data   = part.get();
+        dst_c.src[1] = &K_h;
+        dst_c.src[2] = &V_h;
+        dst_c.src[3] = mask ? &mask_c : nullptr;
+
+        const ggml_cuda_fattn_chunk state = { (float *) dst->data, meta.get(), ic == 0, ic == n_chunks - 1 };
+        ctx.fattn_chunk = &state;
+        ggml_cuda_flash_attn_ext_mma_f16(ctx, &dst_c);
+        ctx.fattn_chunk = nullptr;
+    }
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // GGML_CUDA_FA_CHUNK: this op copies its own K/V chunks from the original addresses (no whole-op staging; the
+    // tier prefetch leaves these ops out, see ggml_cuda_tier_graph_begin)
+    if (ggml_cuda_flash_attn_ext_chunked(dst)) {
+        ggml_cuda_flash_attn_ext_chunks(ctx, dst);
+        return;
+    }
+
     ggml_tensor * mask_in = dst->src[3];
     ggml_tensor mask_f16;
     ggml_cuda_pool_alloc<half> mask_buf(ctx.pool());

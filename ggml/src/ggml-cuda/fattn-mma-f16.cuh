@@ -1959,7 +1959,11 @@ static __global__ void flash_attn_ext_f16(
     const int stride_K    = type_KV == GGML_TYPE_F16 ? nb11 / sizeof(half2) : nb11;
     // packed mask: the row stride travels through the tile functions as a NEGATIVE count of 32-bit words (the
     // sign is the flag, so no inner signature changes); the mask loader expands bits into the f16 tile.
-    const int stride_mask = mask_packed ? -(int) (nb31 / sizeof(uint32_t)) : (int) (nb31 / sizeof(half));
+    const int stride_mask = (mask_packed & 1) ? -(int) (nb31 / sizeof(uint32_t)) : (int) (nb31 / sizeof(half));
+
+    // mask_packed & 2: chunk launch (GGML_CUDA_FA_CHUNK, launch_fattn). Every block has one whole tile and takes the
+    // needs_fixup path: unnormalized output to dst, (max, rowsum) to dst_meta, for the chunk fold kernel.
+    const bool chunk_part = (mask_packed & 2) != 0;
 
     const int stride_V = V_is_K_view ? stride_K : (type_KV == GGML_TYPE_F16 ? nb21 / sizeof(half2) : nb21);
 
@@ -2003,13 +2007,13 @@ static __global__ void flash_attn_ext_f16(
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
+        if (kb0_start == 0 && !chunk_part) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
-            constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
+            constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile, or a chunk launch.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_KV>
                 (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);

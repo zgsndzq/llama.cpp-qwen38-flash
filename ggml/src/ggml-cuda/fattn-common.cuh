@@ -51,26 +51,40 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
-// GGML_CUDA_FA_PREFILL_F16=N: prefill-sized batches (more than 8 queries) over a quantized K/V cache of at most N cells
-// convert K/V to f16 in pool memory sized by the actual KV length and run the f16 MMA kernel; decode keeps the in-place
-// quantized read. Nothing is reserved at load (the reserved f16 copy would be n_ctx cells).
+// GGML_CUDA_FA_PREFILL_F16=N: prefill-sized batches (at least GGML_CUDA_FA_PREFILL_F16_MIN_Q queries, default 64) over a
+// quantized K/V cache of at most N cells convert K/V to f16 in pool memory sized by the actual KV length and run the f16
+// MMA kernel; decode keeps the in-place quantized read. Nothing is reserved at load (the reserved f16 copy would be n_ctx
+// cells). The minimum keeps speculative verify batches (a lookup drafter makes them up to 33 queries) on the in-place
+// read: converting the whole cache for each verify step cost 9-10% of decode on file rewrites (RTX 4070, 30k context).
+static inline int64_t ggml_cuda_fattn_prefill_min_q() {
+    static const int64_t min_q = [] {
+        const char * e = getenv("GGML_CUDA_FA_PREFILL_F16_MIN_Q");
+        return e ? std::max<int64_t>(1, atoll(e)) : (int64_t) 64;
+    }();
+    return min_q;
+}
+
 static inline bool ggml_cuda_fattn_prefill_f16(const ggml_tensor * dst) {
     static const int64_t max_kv = [] {
         const char * e = getenv("GGML_CUDA_FA_PREFILL_F16");
         return e ? (int64_t) atoll(e) : (int64_t) 0;
     }();
-    // a lookup drafter in front of the MTP head makes verify batches of up to 33 queries; with the
-    // threshold at 8 every verify step converted the whole cache again (9-10 % of decode on file
-    // rewrites, RTX 4070, 30k context). Prefill micro-batches of 256-1024 still convert.
-    static const int64_t min_q = [] {
-        const char * e = getenv("GGML_CUDA_FA_PREFILL_F16_MIN_Q");
-        return e ? (int64_t) std::max<int64_t>(1, atoll(e)) : (int64_t) 64;
-    }();
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    return max_kv > 0 && Q->ne[1] >= min_q && K->ne[1] <= max_kv && K->type == V->type && ggml_is_quantized(K->type);
+    return max_kv > 0 && Q->ne[1] >= ggml_cuda_fattn_prefill_min_q() && K->ne[1] <= max_kv && K->type == V->type && ggml_is_quantized(K->type);
 }
+
+// GGML_CUDA_FA_CHUNK (fattn.cu): one launch_fattn call is one KV chunk of a chunked attention op. The kernel then
+// gives every output tile to one block and writes the unnormalized output and the (max, rowsum) of each row to
+// the meta buffer, the same way a stream-k block that misses the start of its tile does. A fold kernel adds the
+// chunk to the running result in dst and meta; the last chunk divides by the row sum.
+struct ggml_cuda_fattn_chunk {
+    float  * dst;   // running output, in the layout of the attention op's dst
+    float2 * meta;  // running (max, rowsum), one per output row and Q head
+    bool     first;
+    bool     last;
+};
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
@@ -1000,6 +1014,72 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// GGML_CUDA_FA_CHUNK: add one KV chunk to the running result. part is the chunk's unnormalized output (dst layout),
+// part_meta its (max, rowsum) per block and column (one block per output tile). One CUDA block per output row
+// and Q head of a tile, as in flash_attn_stream_k_fixup_uniform.
+template<int D, int ncols1, int ncols2> // D == head size
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_chunk_fold(
+        const float  * __restrict__ part,
+        const float2 * __restrict__ part_meta,
+        float        * __restrict__ acc,
+        float2       * __restrict__ acc_meta,
+        const int ne01, const int ne02, const int ne12,
+        const int gqa_ratio, const int ntiles_x, const int ntiles_z_gqa,
+        const int first, const int last) {
+    constexpr int ncols = ncols1*ncols2;
+
+    const int tile = blockIdx.x;
+    const int j    = blockIdx.y;
+    const int c    = blockIdx.z;
+    const int jc   = j*ncols2 + c;
+    const int tid  = threadIdx.x;
+
+    // same tile order as the kernel: jt fastest, then zt_gqa, z_KV, sequence
+    const int jt       =  tile % ntiles_x;
+    const int zt_gqa   = (tile / ntiles_x) % ntiles_z_gqa;
+    const int z_KV     = (tile / (ntiles_x*ntiles_z_gqa)) % ne12;
+    const int sequence =  tile / (ntiles_x*ntiles_z_gqa*ne12);
+
+    const int row = jt*ncols1 + j;
+    if (row >= ne01 || zt_gqa*ncols2 + c >= gqa_ratio) {
+        return;
+    }
+    const int     head = z_KV*gqa_ratio + zt_gqa*ncols2 + c;
+    const int64_t r    = (int64_t(sequence)*ne01 + row)*ne02 + head;
+
+    const float  val_add = part[r*D + tid];
+    const float2 meta_add = part_meta[tile*ncols + jc];
+
+    float  val  = val_add;
+    float2 meta = meta_add;
+    if (!first) {
+        const float2 meta_acc = acc_meta[r];
+        const float  max_new  = fmaxf(meta_acc.x, meta_add.x);
+
+        const float diff_acc = meta_acc.x - max_new;
+        const float diff_add = meta_add.x - max_new;
+
+        const float scale_acc = diff_acc >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_acc) : 0.0f;
+        const float scale_add = diff_add >= SOFTMAX_FTZ_THRESHOLD ? expf(diff_add) : 0.0f;
+
+        val  = scale_acc*acc[r*D + tid] + scale_add*val_add;
+        meta = make_float2(max_new, scale_acc*meta_acc.y + scale_add*meta_add.y);
+    }
+
+    if (last) {
+        acc[r*D + tid] = val / meta.y;
+        return;
+    }
+    acc[r*D + tid] = val;
+
+    // every thread of the block has read acc_meta[r] before it changes
+    __syncthreads();
+    if (tid == 0) {
+        acc_meta[r] = meta;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1033,6 +1113,10 @@ void launch_fattn(
     const int id  = ggml_cuda_get_device();
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
+
+    // GGML_CUDA_FA_CHUNK: this launch is one KV chunk (only the tensor-core kernel runs chunks; it is a stream-k launch)
+    const ggml_cuda_fattn_chunk * chunk = ctx.fattn_chunk;
+    GGML_ASSERT(!chunk || stream_k);
 
     // GGML_CUDA_FA_PREFILL_F16: the f16 copies come from the pool, not from the space reserved behind dst
     const bool prefill_f16 = ggml_cuda_fattn_prefill_f16(dst);
@@ -1172,7 +1256,8 @@ void launch_fattn(
         const int tiles_nwaves = (ntiles_dst + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_dst / (max_blocks*tiles_nwaves);
 
-        const bool use_stream_k = cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75;
+        // a chunk launch keeps one block per output tile: every block writes its partial result and meta
+        const bool use_stream_k = !chunk && (cc >= GGML_CUDA_CC_ADA_LOVELACE || amd_wmma_available(cc) || tiles_efficiency_percent < 75);
 
         blocks_num.x = ntiles_dst;
         blocks_num.y = 1;
@@ -1194,7 +1279,9 @@ void launch_fattn(
             blocks_num.x = nblocks_stream_k;
         }
 
-        if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
+        if (chunk) {
+            dst_tmp_meta.alloc(size_t(ntiles_dst) * ncols); // (max, rowsum) per block and column
+        } else if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
@@ -1274,11 +1361,19 @@ void launch_fattn(
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
-        mask_packed ? 1 : 0
+        (mask_packed ? 1 : 0) | (chunk ? 2 : 0)   // 2: chunk launch (fattn-mma-f16.cuh)
     );
     CUDA_CHECK(cudaGetLastError());
 
-    if (stream_k) {
+    if (chunk) {
+        GGML_ASSERT((int) blocks_num.x == ntiles_dst);
+        const dim3 block_dim_fold(DV, 1, 1);
+        const dim3 blocks_num_fold = {(unsigned) ntiles_dst, ncols1, ncols2};
+        flash_attn_chunk_fold<DV, ncols1, ncols2><<<blocks_num_fold, block_dim_fold, 0, main_stream>>>(
+            (const float *) KQV->data, dst_tmp_meta.ptr, chunk->dst, chunk->meta,
+            Q->ne[1], Q->ne[2], K->ne[2], gqa_ratio, ntiles_x, ntiles_z_gqa,
+            chunk->first ? 1 : 0, chunk->last ? 1 : 0);
+    } else if (stream_k) {
         if ((int)blocks_num.x % ntiles_dst == 0 && (int)blocks_num.x > ntiles_dst) {
             // Optimized fixup: nblocks_stream_k is a multiple of ntiles_dst, launch one block per tile.
             const int nblocks_sk  = (int)blocks_num.x;

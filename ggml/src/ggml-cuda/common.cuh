@@ -1643,6 +1643,8 @@ struct ggml_cuda_fwht_q8_context {
 bool ggml_cuda_shared_pool_enabled();
 ggml_cuda_pool & ggml_cuda_shared_pool(int device, int stream_no);
 
+struct ggml_cuda_fattn_chunk; // fattn-common.cuh
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1715,6 +1717,9 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_gdn_gather_context gdn_gather_context;
     ggml_cuda_fwht_q8_context    fwht_q8_context;
+
+    // GGML_CUDA_FA_CHUNK (fattn.cu): set while one KV chunk of a chunked attention op runs; read by launch_fattn
+    const ggml_cuda_fattn_chunk * fattn_chunk = nullptr;
 
     ~ggml_backend_cuda_context();
 

@@ -1206,6 +1206,74 @@ static void ggml_cuda_tier_unregister(CUdeviceptr va) {
     }
 }
 
+// Every tiered buffer with all its runs (VRAM, staged host, unstaged host), with or without a staging alias. Used by
+// ggml_cuda_tier_copy_out (chunked attention, fattn.cu). Each run is one allocation, so copies never cross a run.
+struct ggml_cuda_tier_run {
+    size_t off, len;
+    bool   host;
+};
+struct ggml_cuda_tier_span {
+    CUdeviceptr va;
+    size_t      total;
+    std::vector<ggml_cuda_tier_run> runs;
+};
+static std::vector<ggml_cuda_tier_span> g_tier_spans; // guarded by g_tier_mutex
+
+static void ggml_cuda_tier_span_register(CUdeviceptr va, size_t total, const std::vector<ggml_cuda_tier_run> & runs) {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    g_tier_spans.push_back({ va, total, runs });
+}
+
+static void ggml_cuda_tier_span_unregister(CUdeviceptr va) {
+    std::lock_guard<std::mutex> lock(g_tier_mutex);
+    for (size_t i = 0; i < g_tier_spans.size(); ++i) {
+        if (g_tier_spans[i].va == va) {
+            g_tier_spans.erase(g_tier_spans.begin() + i);
+            return;
+        }
+    }
+}
+
+// [ptr, ptr + nbytes) lies in one tiered buffer and reaches a host-backed run: copy the whole range to dst (VRAM,
+// nbytes) with the copy engine, one copy per run, stream-ordered, and return true. Otherwise copy nothing, false.
+// dst == nullptr: only report whether it would copy.
+bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream) {
+    const CUdeviceptr p = (CUdeviceptr) ptr;
+    std::vector<ggml_cuda_tier_run> pieces;
+    {
+        std::lock_guard<std::mutex> lock(g_tier_mutex);
+        const ggml_cuda_tier_span * s = nullptr;
+        for (auto & it : g_tier_spans) {
+            if (p >= it.va && p < it.va + it.total) {
+                s = &it;
+                break;
+            }
+        }
+        if (!s || p - s->va + nbytes > s->total) {
+            return false;
+        }
+        const size_t lo = p - s->va, hi = lo + nbytes;
+        bool any_host = false;
+        for (auto & rr : s->runs) {
+            const size_t a = std::max(lo, rr.off), b = std::min(hi, rr.off + rr.len);
+            if (a < b) {
+                pieces.push_back({ a - lo, b - a, rr.host });
+                any_host = any_host || rr.host;
+            }
+        }
+        if (!any_host) {
+            return false;
+        }
+    }
+    if (!dst) {
+        return true;
+    }
+    for (auto & pc : pieces) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst + pc.off, (const char *) ptr + pc.off, pc.len, cudaMemcpyDeviceToDevice, stream));
+    }
+    return true;
+}
+
 // VRAM staging buffers shared by the tiered buffers of one KV cache: slot i backs the i-th host run (K tail, V
 // tail). The layers of a cache run one after another on one stream, so they can share them; another cache (the MTP
 // draft context's) runs on its own stream and can overlap with this one's work, so it gets its own. The cache is
@@ -1326,7 +1394,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
         return nullptr;
     }
 
-    struct run { CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; bool staged; };
+    struct run { CUdeviceptr ptr; size_t len; CUmemGenericAllocationHandle h; bool staged; bool host; };
     std::vector<run> runs;
     auto undo = [runs_p = &runs, va, total]() {
         for (auto & rr : *runs_p) {
@@ -1357,7 +1425,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
             undo();
             return nullptr;
         }
-        runs.push_back({ va + p*gran, len, h, (bool) staged[p] });
+        runs.push_back({ va + p*gran, len, h, (bool) staged[p], !in_vram[p] });
         p = q;
     }
 
@@ -1374,6 +1442,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 
     GGML_LOG_INFO("%s: %s %.2f MiB: %.2f MiB VRAM + %.2f MiB host (%zu runs, %d parts)\n", __func__, bctx->name.c_str(),
         size/1048576.0, n_vram*gran/1048576.0, (n_pages - n_vram)*gran/1048576.0, runs.size(), parts);
+
+    {
+        std::vector<ggml_cuda_tier_run> span_runs;
+        for (auto & rr : runs) {
+            span_runs.push_back({ (size_t) (rr.ptr - va), rr.len, rr.host });
+        }
+        ggml_cuda_tier_span_register(va, total, span_runs);
+    }
 
     // staging alias (see the comment above ggml_cuda_tier_entry)
     CUdeviceptr va2 = 0;
@@ -1421,6 +1497,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
     ctx->release = [runs, va, va2, total, device]() {
         ggml_cuda_set_device(device);
         cudaDeviceSynchronize();
+        ggml_cuda_tier_span_unregister(va);
         if (va2) {
             ggml_cuda_tier_unregister(va);
             for (auto & rr : runs) {
@@ -1440,6 +1517,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_ty
 void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream) {
     GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
     return nullptr;
+}
+
+bool ggml_cuda_tier_copy_out(void * dst, const void * ptr, size_t nbytes, cudaStream_t stream) {
+    GGML_UNUSED(dst); GGML_UNUSED(ptr); GGML_UNUSED(nbytes); GGML_UNUSED(stream);
+    return false;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_tier_alloc(ggml_backend_buffer_type_t buft, size_t size) {
@@ -1630,7 +1712,10 @@ static void ggml_cuda_tier_graph_begin(ggml_backend_cuda_context & ctx, ggml_cud
                 }
             }
         }
+        // ops that take the chunked path (GGML_CUDA_FA_CHUNK) copy their own K/V chunks, never read staging and
+        // never call ggml_cuda_tier_fa_begin, so they stay out of the pipeline
         if (prefetch_on && n->op == GGML_OP_FLASH_ATTN_EXT && n->src[1] && n->src[2] && n->src[1] != n->src[2] &&
+                !ggml_cuda_flash_attn_ext_chunked(n) &&
                 (ggml_cuda_tier_reaches_host(n->src[1]) || ggml_cuda_tier_reaches_host(n->src[2]))) {
             ts.fa.push_back(n);
         }

@@ -3559,11 +3559,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     {
         // the tier prefetch pipeline instead (see ggml_cuda_tier_graph_wants_pipeline); one log line per switch
+        // DEBUG, not WARN: one server runs two contexts (target + MTP draft), so the state alternates on every
+        // round once the target crosses the VRAM head -- that is expected, not a warning. Raise -lv 4 to see it.
         static int last = -1;
         const bool pipe = ggml_cuda_tier_graph_wants_pipeline(cgraph);
         if ((int) pipe != last) {
             last = (int) pipe;
-            GGML_LOG_WARN("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s\n", __func__,
+            GGML_LOG_DEBUG("%s: attention %s the host tail of the tiered KV cache: CUDA graphs %s\n", __func__,
                 pipe ? "reads" : "does not read", pipe ? "off, tier prefetch pipeline on" : "on");
         }
         if (pipe) {

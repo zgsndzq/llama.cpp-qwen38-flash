@@ -550,6 +550,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // feature-sharded activation times a full-width mirrored operand: each shard reads its
+        // slice of src1 (see init_tensor), which is only done for the four elementwise ops
+        if (tensor->op != GGML_OP_ADD_ID && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                src_ss[0].n_segments == 1 && src_ss[0].nr[0] == 1 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                tensor->src[1]->ne[0] == tensor->src[0]->ne[0]) {
+            return src_ss[0];
+        }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
@@ -581,7 +589,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
-            ret.nr[0] = 1;
+            ret.nr[0] = src_ss[0].n_segments == 1 ? src_ss[0].nr[0] : 1;
             ret.n_segments = 1;
             return ret;
         }
@@ -596,6 +604,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[0].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return src_ss[0];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[1].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[1].axis < GGML_MAX_DIMS) {
+            return src_ss[1];
         }
         // batched matmul with the batches split across devices and a replicated activation
         if (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_2 && src_ss[0].axis < GGML_MAX_DIMS &&
@@ -669,6 +681,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_view = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (tensor->src[0]->op == GGML_OP_GATED_DELTA_NET && tensor->view_offs == 0 &&
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const ggml_tensor * q = tensor->src[0]->src[0];
+            const ggml_tensor * v = tensor->src[0]->src[2];
+            if (tensor->ne[0] == v->ne[0] && tensor->ne[1] == v->ne[1] &&
+                    v->ne[1] > q->ne[1] && v->ne[1] % q->ne[1] == 0) {
+                return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {uint32_t(v->ne[1] / q->ne[1])}, 1};
+            }
+        }
         if (ggml_is_contiguous(tensor) && ggml_is_contiguous(tensor->src[0])) {
             return handle_reshape(src_ss);
         }
@@ -1267,6 +1288,20 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             } else if (t_ij->src[i] != nullptr && ggml_backend_buffer_is_meta(t_ij->src[i]->buffer)) {
                 t_ij->src[i] = ggml_backend_meta_buffer_simple_tensor(tensor->src[i], j);
             }
+        }
+
+        if ((tensor->op == GGML_OP_MUL || tensor->op == GGML_OP_ADD || tensor->op == GGML_OP_SUB || tensor->op == GGML_OP_DIV) &&
+                split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 && split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+                tensor->src[1]->ne[0] == tensor->src[0]->ne[0] &&
+                ggml_backend_buffer_is_meta(tensor->src[1]->buffer) &&
+                ggml_backend_meta_get_split_state(tensor->src[1], true).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            int64_t offset = 0;
+            for (size_t k = 0; k < j; k++) {
+                offset += split_state.ne[k];
+            }
+            ggml_tensor * source = t_ij->src[1];
+            t_ij->src[1] = ggml_view_4d(simple_ctx, source, ne[0], source->ne[1], source->ne[2], source->ne[3],
+                source->nb[1], source->nb[2], source->nb[3], offset * source->nb[0]);
         }
 
         simple_tensors.push_back(t_ij);

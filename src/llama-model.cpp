@@ -605,6 +605,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2 + head_ratio}};
                 }
+                if (ud->model->hadamard_gdn_v_grouped && std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    return {{value_dim, 1}};
+                }
                 if (std::regex_match(tensor_name, pattern_attn_gate_weight) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                     return {{key_dim, head_ratio}};
                 }
@@ -659,6 +662,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t head_dim        = hparams.ssm_d_state;
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
+            if (ud->model->hadamard_gdn_v_grouped && std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_dt_rank / hparams.ssm_n_group));
+            }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
                     std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
@@ -771,7 +777,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
-        const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
+        int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
+        if (const auto it = ud->model->hadamard_weight_blocks.find(tc.tensor_axis_0->name);
+                it != ud->model->hadamard_weight_blocks.end()) {
+            blck_size = std::lcm(blck_size, int64_t(it->second));
+        }
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);

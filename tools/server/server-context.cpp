@@ -2715,8 +2715,11 @@ private:
                             size_t n_dft = 0;
                             llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
                             if (std::ifstream(path_dft).good()) {
-                                size_t n_tok_dft = 0;
-                                n_dft = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, nullptr, 0, &n_tok_dft);
+                                // a token buffer is required: with tokens_out == nullptr the call only reads the
+                                // 12-byte header and restores nothing. The sidecar is saved with no tokens.
+                                llama_token tok_dft   = 0;
+                                size_t      n_tok_dft = 0;
+                                n_dft = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, &tok_dft, 1, &n_tok_dft);
                             }
                             if (n_dft == 0) {
                                 llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);

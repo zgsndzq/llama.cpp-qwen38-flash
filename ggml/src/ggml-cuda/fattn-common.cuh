@@ -59,10 +59,17 @@ static inline bool ggml_cuda_fattn_prefill_f16(const ggml_tensor * dst) {
         const char * e = getenv("GGML_CUDA_FA_PREFILL_F16");
         return e ? (int64_t) atoll(e) : (int64_t) 0;
     }();
+    // a lookup drafter in front of the MTP head makes verify batches of up to 33 queries; with the
+    // threshold at 8 every verify step converted the whole cache again (9-10 % of decode on file
+    // rewrites, RTX 4070, 30k context). Prefill micro-batches of 256-1024 still convert.
+    static const int64_t min_q = [] {
+        const char * e = getenv("GGML_CUDA_FA_PREFILL_F16_MIN_Q");
+        return e ? (int64_t) std::max<int64_t>(1, atoll(e)) : (int64_t) 64;
+    }();
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    return max_kv > 0 && Q->ne[1] > 8 && K->ne[1] <= max_kv && K->type == V->type && ggml_is_quantized(K->type);
+    return max_kv > 0 && Q->ne[1] >= min_q && K->ne[1] <= max_kv && K->type == V->type && ggml_is_quantized(K->type);
 }
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(

@@ -14,8 +14,9 @@ if not exist "%~dp0build.local.bat" (
   exit /b 9
 )
 call "%~dp0build.local.bat"
-call "%VCVARS%"
+if defined VCVARS call "%VCVARS%"
 if errorlevel 1 ( echo VCVARS_FAILED > "%LOG%" & exit /b 1 )
+call "%~dp0_cache_guard.bat"
 
 echo CFG_START %DATE% %TIME% > "%LOG%"
 rem If the runtime cannot find a compiled FA vector kernel for our K/V types it silently

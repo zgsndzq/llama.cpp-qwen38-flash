@@ -1335,15 +1335,32 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
     };
 
     // redirect elements in stacks to point to new rules
+    // (each stack element is found by a binary search over the rules' start addresses: the search over every element
+    // of every rule cost O(stack elements x grammar size) per clone, and the server clones the sampler on every
+    // speculative step - with a grammar for 100 tool schemas that was about 10 ms per step)
+    std::vector<std::pair<const llama_grammar_element *, size_t>> starts;
+    starts.reserve(grammar.rules.size());
+    for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
+        if (!grammar.rules[ir0].empty()) {
+            starts.emplace_back(grammar.rules[ir0].data(), ir0);
+        }
+    }
+    std::sort(starts.begin(), starts.end(), [](const auto & a, const auto & b) { return std::less<const llama_grammar_element *>()(a.first, b.first); });
     for (size_t is = 0; is < result->stacks.size(); is++) {
         for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
-                    }
-                }
+            const llama_grammar_element * pe = grammar.stacks[is][ie];
+            auto it = std::upper_bound(starts.begin(), starts.end(), pe,
+                [](const llama_grammar_element * v, const auto & e) { return std::less<const llama_grammar_element *>()(v, e.first); });
+            if (it == starts.begin()) {
+                continue;
             }
+            --it;
+            const size_t ir0 = it->second;
+            const auto & rule = grammar.rules[ir0];
+            if (!std::less<const llama_grammar_element *>()(pe, rule.data() + rule.size())) {
+                continue;
+            }
+            result->stacks[is][ie] = &result->rules[ir0][(size_t) (pe - rule.data())];
         }
     }
 

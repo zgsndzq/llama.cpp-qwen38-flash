@@ -2638,6 +2638,16 @@ private:
                         break;
                     }
 
+                    // the draft context (MTP / draft model) of this slot goes into a sidecar file next to it, so a
+                    // restore in a fresh process continues with the same draft state (without it the first prompt
+                    // after a restore runs the draft context from empty: ~9-11x slower prefill on an 8 GB 2060)
+                    if (ctx_dft) {
+                        const std::string path_dft = filepath + ".draft";
+                        if (llama_state_seq_save_file(ctx_dft, path_dft.c_str(), slot->id, nullptr, 0) == 0) {
+                            SRV_WRN("slot %d: draft context state not saved to %s\n", slot->id, path_dft.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2697,6 +2707,25 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // the draft context: its sidecar file when there is one, else an empty draft sequence (it then
+                        // refills from the next prompt, as it did before)
+                        if (ctx_dft) {
+                            const std::string path_dft = filepath + ".draft";
+                            size_t n_dft = 0;
+                            llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                            if (std::ifstream(path_dft).good()) {
+                                size_t n_tok_dft = 0;
+                                n_dft = llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id, nullptr, 0, &n_tok_dft);
+                            }
+                            if (n_dft == 0) {
+                                llama_memory_seq_rm(llama_get_memory(ctx_dft), slot->id, -1, -1);
+                                SRV_WRN("slot %d: no draft context state for %s (the draft context starts empty)\n",
+                                    slot->id, filename.c_str());
+                            } else {
+                                SRV_INF("slot %d: draft context state restored (%zu bytes)\n", slot->id, n_dft);
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

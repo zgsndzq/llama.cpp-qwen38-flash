@@ -200,7 +200,9 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         if constexpr (sizeof(T) == sizeof(uint32_t)) {
-            const bool transpose_dim0 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_DGX_SPARK &&
+            // on every NVIDIA card, not only GB10: the gated-delta-net conv state at 2+ tokens (a draft verification
+            // step) took 14.5 us per call in the generic kernel on an RTX 4070, 48 calls per step
+            const bool transpose_dim0 = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
                 dim == 0 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 dst->ne[2] == 1 && dst->ne[3] == 1 && src0->ne[0] <= 8 &&
                 src0->nb[0] == sizeof(uint32_t) && src0->nb[1] == (uint64_t) src0->ne[0]*sizeof(uint32_t) &&

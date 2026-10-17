@@ -79,6 +79,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <thread>
+#include <chrono>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -574,6 +576,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         const size_t alignment = 128;
         size = alignment * ((size + alignment - 1) / alignment);
 
+        reserve_once();
+
         size_t avail = pool_size - pool_used;
 
         if (size > avail) {
@@ -583,28 +587,135 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
-            // allocate more physical memory
-            CUmemAllocationProp prop = {};
-            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = physical_device;
-            CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            grow(reserve_size, size);
+        }
 
-            // reserve virtual address space (if not already reserved)
-            if (pool_addr == 0) {
-                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
-            }
+        GGML_ASSERT(pool_addr != 0);
 
-            // map at the end of the pool
-            CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
-            CU_CHECK(cuMemMap(start_ptr, reserve_size, 0, handle, 0));
-#if defined(GGML_USE_HIP)
-            mappings.push_back({start_ptr, reserve_size});
+        void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
+        *actual_size = size;
+        pool_used += size;
+
+#ifdef DEBUG_CUDA_MALLOC
+        printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
 #endif
 
-            // the memory allocation handle is no longer needed after mapping
-            CU_CHECK(cuMemRelease(handle));
+        return ptr;
+    }
+
+    // GGML_CUDA_POOL_RESERVE_MIB=n: grow this pool to n MiB at its first use, before anything else fills the card (a
+    // restored conversation's first prompt needs the deep-context pool size in one step; a cold read grows it bit by bit)
+    void reserve_once() {
+        static const size_t want = [] {
+            const char * e = getenv("GGML_CUDA_POOL_RESERVE_MIB");
+            return e ? (size_t) std::max(0ll, atoll(e)) << 20 : (size_t) 0;
+        }();
+        if (reserved || want == 0) {
+            return;
+        }
+        reserved = true;
+        if (pool_size < want) {
+            const size_t len = granularity * ((want - pool_size + granularity - 1) / granularity);
+            grow(len);
+            GGML_LOG_INFO("%s: cuda pool[%d] reserved %.1f MiB (GGML_CUDA_POOL_RESERVE_MIB)\n", __func__, device, pool_size/1048576.0);
+        }
+    }
+    bool reserved = false;
+
+    // add reserve_size bytes of physical memory at the end of the pool. Under WDDM a growth can fail for a moment
+    // (CUDA_ERROR_NOT_READY from cuMemSetAccess seen on an 8 GB card): undo the partial step, sync and retry, and say
+    // why before giving up
+    void grow(size_t reserve_size, size_t request = 0) {
+        const size_t target = pool_size + reserve_size;
+        for (int attempt = 0; ; ++attempt) {
+            const char * what = nullptr;
+            CUresult rc = grow_try(target - pool_size, &what);
+            if (rc == CUDA_SUCCESS) {
+                if (attempt > 0) {
+                    GGML_LOG_WARN("%s: cuda pool[%d] grew by %.1f MiB on attempt %d\n", __func__, device, reserve_size/1048576.0, attempt + 1);
+                }
+                // GGML_CUDA_POOL_LOG=1: one line per growth step, tagged with the pool instance (one pool per backend
+                // instance per device; each llama_context creates its own backends, so a draft context has its own pool
+                // and its high-water mark is never returned). Diagnostics only; off by default.
+                static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
+                if (pool_log) {
+                    GGML_LOG_INFO("cuda pool[%d] %p: size %llu MiB (+%llu MiB for a %llu MiB request)\n", device, (void *) this,
+                        (unsigned long long) (pool_size/1024/1024), (unsigned long long) (reserve_size/1024/1024),
+                        (unsigned long long) (request/1024/1024));
+                }
+                return;
+            }
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            const char * es = nullptr;
+            cuGetErrorString(rc, &es);
+            GGML_LOG_WARN("%s: cuda pool[%d]: growing %.1f -> %.1f MiB failed in %s (%s), %.1f MiB free (attempt %d)\n",
+                __func__, device, pool_size/1048576.0, target/1048576.0, what, es ? es : "?",
+                free_b/1048576.0, attempt + 1);
+            if (attempt >= 3) {
+                GGML_ABORT("cuda pool: out of device memory for the compute pool (close other GPU apps, or lower the "
+                    "VRAM line / set GGML_CUDA_POOL_RESERVE_MIB so the pool is reserved at start)");
+            }
+            cudaDeviceSynchronize();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50 << attempt));
+        }
+    }
+
+    // GGML_CUDA_POOL_GROW_PIECE_MIB=n (default 16): a growth is mapped as several allocations of at most n MiB. A cold
+    // read grows the pool 2 MiB at a time; after a slot restore the first deep batch asked for ~170 MiB as ONE allocation,
+    // and on a full 8 GB card under WDDM that one failed (cuMemSetAccess: CUDA_ERROR_NOT_READY) where small pieces fit.
+    // Pieces that succeed stay in the pool, so a retry only asks for the rest.
+    CUresult grow_try(size_t reserve_size, const char ** what) {
+        static const size_t piece_max = [] {
+            const char * e = getenv("GGML_CUDA_POOL_GROW_PIECE_MIB");
+            const long long v = e ? atoll(e) : 16;
+            return (size_t) std::max(1ll, v) << 20;
+        }();
+        const size_t piece = std::max(granularity, granularity * (piece_max / granularity));
+        size_t left = reserve_size;
+        while (left > 0) {
+            const size_t len = std::min(left, piece);
+            const CUresult rc = grow_piece(len, what);
+            if (rc != CUDA_SUCCESS) {
+                return rc;
+            }
+            left -= len;
+        }
+        return CUDA_SUCCESS;
+    }
+
+    CUresult grow_piece(size_t reserve_size, const char ** what) {
+        // allocate more physical memory
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = physical_device;
+        CUmemGenericAllocationHandle handle;
+        CUresult rc = cuMemCreate(&handle, reserve_size, &prop, 0);
+        if (rc != CUDA_SUCCESS) {
+            *what = "cuMemCreate";
+            return rc;
+        }
+
+        // reserve virtual address space (if not already reserved)
+        if (pool_addr == 0) {
+            CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
+        }
+
+        // map at the end of the pool
+        CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
+        rc = cuMemMap(start_ptr, reserve_size, 0, handle, 0);
+        if (rc != CUDA_SUCCESS) {
+            cuMemRelease(handle);
+            *what = "cuMemMap";
+            return rc;
+        }
+#if defined(GGML_USE_HIP)
+        mappings.push_back({start_ptr, reserve_size});
+#endif
+
+        // the memory allocation handle is no longer needed after mapping
+        CU_CHECK(cuMemRelease(handle));
 
             // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
             bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
@@ -641,41 +752,27 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     access_descs.push_back(access);
                 }
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
+                rc = cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size());
             } else {
                 // set access for non P2P
                 CUmemAccessDesc access = {};
                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                 access.location.id = physical_device;
                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
+                rc = cuMemSetAccess(start_ptr, reserve_size, &access, 1);
+            }
+            if (rc != CUDA_SUCCESS) {
+                cuMemUnmap(start_ptr, reserve_size);
+#if defined(GGML_USE_HIP)
+                mappings.pop_back();
+#endif
+                *what = "cuMemSetAccess";
+                return rc;
             }
 
             // add to the pool
             pool_size += reserve_size;
-
-            // GGML_CUDA_POOL_LOG=1: one line per growth step, tagged with the pool instance (one pool per backend
-            // instance per device; each llama_context creates its own backends, so a draft context has its own pool
-            // and its high-water mark is never returned). Diagnostics only; off by default.
-            static const bool pool_log = getenv("GGML_CUDA_POOL_LOG") != nullptr;
-            if (pool_log) {
-                GGML_LOG_INFO("cuda pool[%d] %p: size %llu MiB (+%llu MiB for a %llu MiB request)\n", device, (void *) this,
-                    (unsigned long long) (pool_size/1024/1024), (unsigned long long) (reserve_size/1024/1024),
-                    (unsigned long long) (size/1024/1024));
-            }
-        }
-
-        GGML_ASSERT(pool_addr != 0);
-
-        void * ptr = (void *) ((CUdeviceptr)((char *)(pool_addr) + pool_used));
-        *actual_size = size;
-        pool_used += size;
-
-#ifdef DEBUG_CUDA_MALLOC
-        printf("cuda pool[%d]: allocated %llu bytes at %llx\n", device, (unsigned long long) size, ptr);
-#endif
-
-        return ptr;
+            return CUDA_SUCCESS;
     }
 
     void free(void * ptr, size_t size) override {

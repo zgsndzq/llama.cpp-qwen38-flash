@@ -707,9 +707,9 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 // adding up. The pool is a LIFO stack, so this is only valid when one thread computes on the device at a time
 // (llama-server does; two contexts computing concurrently from different threads would corrupt it). The pools are
 // leaked on purpose: static destruction may run after the CUDA driver is torn down. Experimental; off by default.
-// Not safe with an MTP draft context: it runs on its own CUDA stream with the same stream index, so the two streams
-// share one LIFO pool and a freed block can be reused before the other stream is done with it (1-token answers to
-// fresh long prompts on an RTX 2060 SUPER). 0 or no value: off.
+// An MTP draft context runs on its own CUDA stream with the same stream index, so the two streams share one LIFO pool;
+// graph compute orders them (ggml_cuda_shared_pool_order). Without that order a freed block could be reused before
+// the other stream was done with it (1-token answers to fresh long prompts on an RTX 2060 SUPER). 0 or no value: off.
 bool ggml_cuda_shared_pool_enabled() {
     static const bool enabled = [] {
         const char * e = getenv("GGML_CUDA_SHARED_POOL");
@@ -731,6 +731,21 @@ ggml_cuda_pool & ggml_cuda_shared_pool(int device, int stream_no) {
         }
     }
     return *p;
+}
+
+// GGML_CUDA_SHARED_POOL: the target and the MTP draft context share one pool but run on their own streams. The pool frees a
+// block on the host when the op is queued, so the other stream could get it while the first is still using it. Each
+// graph waits for the last graph of the other stream (an event recorded after its launch), which orders the two
+// streams at graph boundaries.
+struct ggml_cuda_shared_pool_order {
+    std::mutex   mutex;
+    cudaStream_t last = nullptr;
+    cudaEvent_t  done = nullptr;
+};
+
+static ggml_cuda_shared_pool_order & ggml_cuda_shared_pool_order_get(int device) {
+    static ggml_cuda_shared_pool_order orders[GGML_CUDA_MAX_DEVICES];
+    return orders[device];
 }
 
 // destroying a cuBLAS handle while a graph is being captured in a different thread can result in a CUDA error
@@ -5687,6 +5702,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    if (ggml_cuda_shared_pool_enabled()) {
+        ggml_cuda_shared_pool_order & order = ggml_cuda_shared_pool_order_get(cuda_ctx->device);
+        std::lock_guard<std::mutex> lock(order.mutex);
+        if (order.done != nullptr && order.last != cuda_ctx->stream()) {
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), order.done, 0));
+        }
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -5737,6 +5760,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (ggml_cuda_shared_pool_enabled()) {
+        ggml_cuda_shared_pool_order & order = ggml_cuda_shared_pool_order_get(cuda_ctx->device);
+        std::lock_guard<std::mutex> lock(order.mutex);
+        if (order.done == nullptr) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&order.done, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(order.done, cuda_ctx->stream()));
+        order.last = cuda_ctx->stream();
+    }
 
     return GGML_STATUS_SUCCESS;
 }

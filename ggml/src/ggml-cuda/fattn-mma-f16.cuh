@@ -463,30 +463,47 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
     }
 }
 
-// Dequantize one q4_0 block (32 weights) given its scale and the 16 nibble bytes as 4 words, store 16 half2.
-// Same arithmetic as dequantize_q4_0 -> half, so the tile is bit-identical to a to_fp16 pass over the cache.
+// Dequantize one q4_0 block (32 weights) given its scale and the 16 nibble bytes as 4 words, store 16 half2. Each
+// weight pair is built as a half2 from 1024 + q (mantissa bits), minus 1032, times d. The half multiply rounds the
+// exact product d*(q - 8) once, the same value as dequantize_q4_0 -> half, so the tile stays bit-identical to a
+// to_fp16 pass over the cache, with no int/float conversions.
 static __device__ __forceinline__ void flash_attn_ext_f16_store_q4_0_block(
         half2 * const __restrict__ dst, const float d, const uint32_t q0, const uint32_t q1, const uint32_t q2, const uint32_t q3) {
     const uint32_t q[4] = {q0, q1, q2, q3};
+    const half2 d2    = __float2half2_rn(d);   // exact: d came from an f16 scale
+    const half2 c1032 = __float2half2_rn(1032.0f);
 #pragma unroll
     for (int m = 0; m < 4; ++m) {
-        const uint32_t v = q[m];
-        // low nibbles are weights 4m..4m+3, high nibbles are weights 16+4m..16+4m+3
-        dst[    2*m    ] = __floats2half2_rn(d*(float(int((v      ) & 0xF)) - 8.0f), d*(float(int((v >>  8) & 0xF)) - 8.0f));
-        dst[    2*m + 1] = __floats2half2_rn(d*(float(int((v >> 16) & 0xF)) - 8.0f), d*(float(int((v >> 24) & 0xF)) - 8.0f));
-        dst[8 + 2*m    ] = __floats2half2_rn(d*(float(int((v >>  4) & 0xF)) - 8.0f), d*(float(int((v >> 12) & 0xF)) - 8.0f));
-        dst[8 + 2*m + 1] = __floats2half2_rn(d*(float(int((v >> 20) & 0xF)) - 8.0f), d*(float(int((v >> 28) & 0xF)) - 8.0f));
+        const uint32_t v   = q[m];
+        // bytes 0, 1 and 2, 3 into the low byte of each 16-bit lane; low nibbles are weights 4m..4m+3, high nibbles
+        // are weights 16+4m..16+4m+3
+        const uint32_t x01 = __byte_perm(v, 0, 0x4140);
+        const uint32_t x23 = __byte_perm(v, 0, 0x4342);
+        const uint32_t a = ( x01       & 0x000F000Fu) | 0x64006400u;
+        const uint32_t b = ( x23       & 0x000F000Fu) | 0x64006400u;
+        const uint32_t c = ((x01 >> 4) & 0x000F000Fu) | 0x64006400u;
+        const uint32_t e = ((x23 >> 4) & 0x000F000Fu) | 0x64006400u;
+        dst[    2*m    ] = __hmul2(__hsub2(*(const half2 *) &a, c1032), d2);
+        dst[    2*m + 1] = __hmul2(__hsub2(*(const half2 *) &b, c1032), d2);
+        dst[8 + 2*m    ] = __hmul2(__hsub2(*(const half2 *) &c, c1032), d2);
+        dst[8 + 2*m + 1] = __hmul2(__hsub2(*(const half2 *) &e, c1032), d2);
     }
 }
 
-// Dequantize one q8_0 block (32 weights) given its scale and the 32 int8 bytes as 8 words, store 16 half2.
+// Dequantize one q8_0 block (32 weights) given its scale and the 32 int8 bytes as 8 words, store 16 half2. Each weight
+// pair as a half2 from 1024 + (q + 128) (the sign bit flipped, 8 mantissa bits), minus 1152, times d: bit-exact with
+// the float path (d*q is exact in f32 and rounded to half once either way).
 static __device__ __forceinline__ void flash_attn_ext_f16_store_q8_0_block(
         half2 * const __restrict__ dst, const float d, const uint32_t * const __restrict__ q) {
+    const half2 d2    = __float2half2_rn(d);   // exact: d came from an f16 scale
+    const half2 c1152 = __float2half2_rn(1152.0f);
 #pragma unroll
     for (int m = 0; m < 8; ++m) {
         const uint32_t v = q[m];
-        dst[2*m    ] = __floats2half2_rn(d*float(int(int8_t(v & 0xFF))), d*float(int(int8_t((v >>  8) & 0xFF))));
-        dst[2*m + 1] = __floats2half2_rn(d*float(int(int8_t((v >> 16) & 0xFF))), d*float(int(int8_t((v >> 24) & 0xFF))));
+        const uint32_t a = (__byte_perm(v, 0, 0x4140) ^ 0x00800080u) | 0x64006400u;
+        const uint32_t b = (__byte_perm(v, 0, 0x4342) ^ 0x00800080u) | 0x64006400u;
+        dst[2*m    ] = __hmul2(__hsub2(*(const half2 *) &a, c1152), d2);
+        dst[2*m + 1] = __hmul2(__hsub2(*(const half2 *) &b, c1152), d2);
     }
 }
 

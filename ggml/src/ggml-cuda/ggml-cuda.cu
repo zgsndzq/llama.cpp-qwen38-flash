@@ -701,8 +701,14 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 // adding up. The pool is a LIFO stack, so this is only valid when one thread computes on the device at a time
 // (llama-server does; two contexts computing concurrently from different threads would corrupt it). The pools are
 // leaked on purpose: static destruction may run after the CUDA driver is torn down. Experimental; off by default.
+// Not safe with an MTP draft context: it runs on its own CUDA stream with the same stream index, so the two streams
+// share one LIFO pool and a freed block can be reused before the other stream is done with it (1-token answers to
+// fresh long prompts on an RTX 2060 SUPER). 0 or no value: off.
 bool ggml_cuda_shared_pool_enabled() {
-    static const bool enabled = getenv("GGML_CUDA_SHARED_POOL") != nullptr;
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_SHARED_POOL");
+        return e != nullptr && atoi(e) != 0;
+    }();
     return enabled;
 }
 

@@ -641,8 +641,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type)
+// ggml-cuda.cu: host-tail staging of tiered buffers (ggml_backend_cuda_tier_buffer_type), and its prefetch
 void * ggml_cuda_tier_stage(const void * ptr, size_t nbytes, cudaStream_t stream);
+bool   ggml_cuda_tier_fa_begin(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, void ** K_alias, void ** V_alias);
+void   ggml_cuda_tier_fa_end(ggml_backend_cuda_context & ctx);
 
 // Packed KQ mask (GGML_TYPE_I32, 32 cells per word, bit set = attend) expanded to the f16 form the kernels read,
 // into a pool buffer sized by this op's actual KV length. The reserved input tensor is 16x smaller than an f16
@@ -696,14 +698,28 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // that stay below the tier line. The staged bytes are the same bytes, so results are unchanged.
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+    // With the prefetch (ggml_cuda_tier_graph_begin), the host rows are already in staging when this op starts.
     void * K_data = K ? K->data : nullptr;
     void * V_data = V ? V->data : nullptr;
+    bool tier_piped = false;
     if (K && V && V != K) {
-        if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
-            K->data = a;
-        }
-        if (void * a = ggml_cuda_tier_stage(V->data, ggml_nbytes(V), ctx.stream())) {
-            V->data = a;
+        void * K_alias = nullptr;
+        void * V_alias = nullptr;
+        tier_piped = ggml_cuda_tier_fa_begin(ctx, dst, &K_alias, &V_alias);
+        if (tier_piped) {
+            if (K_alias) {
+                K->data = K_alias;
+            }
+            if (V_alias) {
+                V->data = V_alias;
+            }
+        } else {
+            if (void * a = ggml_cuda_tier_stage(K->data, ggml_nbytes(K), ctx.stream())) {
+                K->data = a;
+            }
+            if (void * a = ggml_cuda_tier_stage(V->data, ggml_nbytes(V), ctx.stream())) {
+                V->data = a;
+            }
         }
     }
 
@@ -719,6 +735,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+    }
+
+    if (tier_piped) {
+        ggml_cuda_tier_fa_end(ctx);
     }
 
     if (K) {

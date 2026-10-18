@@ -673,8 +673,10 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        // Same shape as print_timings_tg, so a prefill line and a generation line read alike;
+        // the "pp" prefix tells them apart, and the whole message is sky blue (256-color 117).
+        SLT_INF(*this, "\033[38;5;117mpp  n_tok = %6d, pp = %6.2f t/s, progress = %.2f\033[0m\n",
+                (int) stats.n_prompt_processed, n_prompt_second, f_progress);
     }
 
     void print_timings() const {
